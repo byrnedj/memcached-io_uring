@@ -574,24 +574,21 @@ static void *worker_libevent(void *arg) {
     LOG("starting cqe based event loop\n");
 
     struct __kernel_timespec ts = {
-        .tv_nsec = 40000,
+        .tv_nsec = 4000,
     };
     struct io_uring_cqe *cqe;
     conn *c;
     unsigned head;
-    unsigned n;
-
+    unsigned n=80;
     unsigned nb;
 
     while (1) {
-        // TODO: timeout & batchsize
-        // int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 10, &ts, NULL);
-        int ret = io_uring_submit_and_wait(&ring, 1);
+        // TODO: automatically adjust timeout & batchsize
+        int ret = io_uring_submit_and_wait_timeout(&ring, &cqe, 80, &ts, NULL);
 
         // TODO: error handling
-        if (ret >= 0 /* ||  ret == -ETIME */) {
+	if (ret >= 0 || ret == -ETIME) {
             n = 0;
-
             io_uring_for_each_cqe(&ring, head, cqe) {
                 LOG("new cqe| ");
                 if (cqe->res < 0) {
@@ -615,8 +612,6 @@ static void *worker_libevent(void *arg) {
                                 c->p = 0;
                                 drive_machine(c);
                                 if (cqe->flags & IORING_CQE_F_BUFFER) {
-                                    //int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-                                    //io_uring_buf_ring_add(me->br, me->buf + BUF_SIZE * bid, BUF_SIZE, bid, BR_MASK, 0);
                                     io_uring_buf_ring_advance(me->br, c->p);
                                 }
                             }
@@ -635,9 +630,6 @@ static void *worker_libevent(void *arg) {
 
                 ++n;
             }
-
-            // if (n > 0)
-            //     printf("batch processed %d conn(s)\n", n);
             io_uring_cq_advance(&ring, n);
             LOG("processed %d CQEs\n", n);
         } else {

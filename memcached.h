@@ -10,7 +10,9 @@
 #endif
 
 #include <poll.h>
+#ifdef IO_URING
 #include <liburing.h>
+#endif
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -721,8 +723,7 @@ struct thread_notify {
 #ifdef MULTISHOT
 #define BGID 1
 // probably too big
-//#define BUF_SIZE 4096
-#define BUF_SIZE 100
+#define BUF_SIZE 4096
 // needs to be power of 2
 #define NR_BUFS 512
 #define BR_MASK (NR_BUFS - 1)
