@@ -3024,16 +3024,10 @@ void drive_machine(conn *c) {
     const char *str;
 
 #ifdef IO_URING
-    enum transmit_result transmit_res;
-    enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     enum transmit_result sentdata;
     struct io_uring_sqe *sqe;
 
-    // parameters for inlined try_network_read
-    int num_allocs = 0;
-    int avail;
-
-    // parameters for inlined transmit
+    // parameters for the inlined transmit
     struct iovec iovs[IOV_MAX];
     struct msghdr msg;
     int iovused = 0;
