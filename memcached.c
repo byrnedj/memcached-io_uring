@@ -822,6 +822,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 #endif
         }
     }
+
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
@@ -2487,7 +2488,6 @@ static enum try_read_result try_read_network(conn *c) {
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
     int num_allocs = 0;
-    int avail;
     assert(c != NULL);
 
     if (c->rcurr != c->rbuf) {
@@ -2519,10 +2519,9 @@ static enum try_read_result try_read_network(conn *c) {
             c->rcurr = c->rbuf = new_rbuf;
             c->rsize *= 2;
         }
-        avail = c->rsize - c->rbytes;
 
+        int avail = c->rsize - c->rbytes;
         res = c->read(c, c->rbuf + c->rbytes, avail);
-
         if (res > 0) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_read += res;
@@ -2742,13 +2741,12 @@ static enum transmit_result transmit(conn *c) {
     struct iovec iovs[IOV_MAX];
     struct msghdr msg;
     int iovused = 0;
-    ssize_t res;
 
     // init the msg.
     memset(&msg, 0, sizeof(struct msghdr));
     msg.msg_iov = iovs;
-    iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ALL_RESP);
 
+    iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ALL_RESP);
     if (iovused == 0) {
         // Avoid the syscall if we're only handling a noreply.
         // Return the response object.
@@ -2757,6 +2755,7 @@ static enum transmit_result transmit(conn *c) {
     }
 
     // Alright, send.
+    ssize_t res;
     msg.msg_iovlen = iovused;
     res = c->sendmsg(c, &msg, 0);
     if (res >= 0) {
@@ -3513,12 +3512,13 @@ void drive_machine(conn *c) {
                         }
                     }
                 }
-#endif
                 ssl_v = (void*) ssl;
+#endif
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
             }
+
             stop = true;
             break;
 
@@ -3530,6 +3530,7 @@ void drive_machine(conn *c) {
                 conn_set_state(c, conn_closing);
                 break;
             }
+
             conn_set_state(c, conn_read);
             stop = true;
             break;
@@ -3547,6 +3548,7 @@ void drive_machine(conn *c) {
                 // UDP connections always have a static buffer.
                 res = try_read_udp(c);
             }
+
             switch (res) {
             case READ_NO_DATA_RECEIVED:
                 conn_set_state(c, conn_waiting);
@@ -3656,11 +3658,13 @@ void drive_machine(conn *c) {
                 if (res > 0)
                     break;
             }
+
             if (res == 0) { /* end of stream */
                 c->close_reason = NORMAL_CLOSE;
                 conn_set_state(c, conn_closing);
                 break;
             }
+
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (!update_event(c, EV_READ | EV_PERSIST)) {
                     if (settings.verbose > 0)
@@ -3671,6 +3675,7 @@ void drive_machine(conn *c) {
                 stop = true;
                 break;
             }
+
             /* Memory allocation failure */
             if (res == -2) {
                 out_of_memory(c, "SERVER_ERROR Out of memory during read");
@@ -3762,6 +3767,7 @@ void drive_machine(conn *c) {
                 stop = true;
                 break;
             }
+
             switch (!IS_UDP(c->transport) ? transmit(c) : transmit_udp(c)) {
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
