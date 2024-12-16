@@ -720,7 +720,7 @@ struct thread_notify {
 #endif
 };
 
-#ifdef MULTISHOT
+#ifdef IO_URING
 #define BGID 1
 // probably too big
 #define BUF_SIZE 4096
@@ -733,10 +733,8 @@ typedef struct _mc_resp_bundle mc_resp_bundle;
 typedef struct {
 #ifdef IO_URING
     struct io_uring *ring;      /* thread specific ring */
-#ifdef MULTISHOT
     struct io_uring_buf_ring* br; /* thread specific buffer ring */
     char* buf;
-#endif
 #endif
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
@@ -840,7 +838,7 @@ struct _io_pending_t {
 /**
  * The structure representing a connection into memcached.
  */
-#ifdef MULTISHOT
+#ifdef IO_URING
 #define NCQES 10
 #endif
 
@@ -850,7 +848,6 @@ struct conn {
     struct iovec iovs[1024];
     struct msghdr msg;
     struct io_uring_cqe *cqe;
-#ifdef MULTISHOT
     struct io_uring_cqe *cqes[NCQES]; // ring buffer
     size_t h; // head
     size_t t; // tail
@@ -858,7 +855,6 @@ struct conn {
     size_t p; // count of currently processed cqes
     bool wait_wcqe;
     bool wait_rcqe;
-#endif
 #endif
     sasl_conn_t *sasl_conn;
     int    sfd;

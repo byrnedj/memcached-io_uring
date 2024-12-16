@@ -1474,10 +1474,7 @@ static void reset_cmd_handler(conn *c) {
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
     } else {
-#if defined(IO_URING) && ! defined(MULTISHOT)
-        rbuf_release(c);
-        conn_set_state(c, conn_read);
-#else
+#ifdef IO_URING
         conn_set_state(c, conn_waiting);
 #endif
     }
@@ -2491,21 +2488,14 @@ static enum try_read_result try_read_network(conn *c) {
     int res;
     int num_allocs = 0;
     int avail;
-#ifdef IO_URING
-    struct io_uring_sqe *sqe;
-#endif
     assert(c != NULL);
 
-#ifdef IO_URING
-    if (!c->wait_cqe) {
-#endif
     if (c->rcurr != c->rbuf) {
         if (c->rbytes != 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
         c->rcurr = c->rbuf;
     }
 
-#ifndef IO_URING
     while (1) {
         // TODO: move to rbuf_* func?
         if (c->rbytes >= c->rsize && c->rbuf_malloced) {
@@ -2529,57 +2519,37 @@ static enum try_read_result try_read_network(conn *c) {
             c->rcurr = c->rbuf = new_rbuf;
             c->rsize *= 2;
         }
-#endif
         avail = c->rsize - c->rbytes;
 
-#ifdef IO_URING
-        sqe = io_uring_get_sqe(c->thread->ring);
-        io_uring_prep_read(sqe, c->sfd, c->rbuf + c->rbytes, avail, 0);
-        io_uring_sqe_set_data(sqe, c);
-        c->wait_cqe = true;
-#else
         res = c->read(c, c->rbuf + c->rbytes, avail);
-#endif
 
-#ifdef IO_URING
-    } else {
-        c->wait_cqe = false;
-        res = c->cqe->res;
-#endif
         if (res > 0) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_read += res;
             pthread_mutex_unlock(&c->thread->stats.mutex);
             gotdata = READ_DATA_RECEIVED;
             c->rbytes += res;
-#ifndef IO_URING
             if (res == avail && c->rbuf_malloced) {
                 // Resize rbuf and try a few times if huge ascii multiget.
                 continue;
             } else {
                 break;
             }
-#endif
         }
         if (res == 0) {
             c->close_reason = NORMAL_CLOSE;
             return READ_ERROR;
         }
         if (res == -1) {
-#ifndef IO_URING
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-#endif
             return READ_ERROR;
         }
-//#ifndef IO_URING
     }
-//#endif
     return gotdata;
 }
 
-// io_uring: we are only updating short mask
 static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
@@ -2774,24 +2744,10 @@ static enum transmit_result transmit(conn *c) {
     int iovused = 0;
     ssize_t res;
 
-#ifdef IO_URING
-    struct io_uring_sqe *sqe;
-#endif
-
-#ifdef IO_URING
-    if (!c->wait_cqe) {
-#endif
-
     // init the msg.
-#ifdef IO_URING
-    memset(&c->msg, 0, sizeof(struct msghdr));
-    c->msg.msg_iov = c->iovs;
-    iovused = _transmit_pre(c, c->iovs, iovused, TRANSMIT_ALL_RESP);
-#else
     memset(&msg, 0, sizeof(struct msghdr));
     msg.msg_iov = iovs;
     iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ALL_RESP);
-#endif
 
     if (iovused == 0) {
         // Avoid the syscall if we're only handling a noreply.
@@ -2801,22 +2757,8 @@ static enum transmit_result transmit(conn *c) {
     }
 
     // Alright, send.
-#ifdef IO_URING
-    c->msg.msg_iovlen = iovused;
-    sqe = io_uring_get_sqe(c->thread->ring);
-    io_uring_prep_sendmsg(sqe, c->sfd, &c->msg, 0);
-    io_uring_sqe_set_data(sqe, c);
-    c->wait_cqe = true;
-    return TRANSMIT_COMPLETE;
-#else
     msg.msg_iovlen = iovused;
     res = c->sendmsg(c, &msg, 0);
-#endif
-#ifdef IO_URING
-    } else {
-    c->wait_cqe = false;
-    res = c->cqe->res;
-#endif
     if (res >= 0) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.bytes_written += res;
@@ -2832,7 +2774,6 @@ static enum transmit_result transmit(conn *c) {
         }
     }
 
-#ifndef IO_URING
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (!update_event(c, EV_WRITE | EV_PERSIST)) {
             if (settings.verbose > 0)
@@ -2842,7 +2783,6 @@ static enum transmit_result transmit(conn *c) {
         }
         return TRANSMIT_SOFT_ERROR;
     }
-#endif
     /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
        we have a real error, on which we close the connection */
     if (settings.verbose > 0)
@@ -2850,10 +2790,6 @@ static enum transmit_result transmit(conn *c) {
 
     conn_set_state(c, conn_closing);
     return TRANSMIT_HARD_ERROR;
-#ifdef IO_URING
-    }
-    return TRANSMIT_COMPLETE;
-#endif
 }
 
 static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
@@ -3117,7 +3053,7 @@ void drive_machine(conn *c) {
         LOG("conn state: %s\n", state_text(c->state));
 
         switch(c->state) {
-#ifdef MULTISHOT
+#ifdef IO_URING
         case conn_listening:
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
@@ -3480,7 +3416,7 @@ void drive_machine(conn *c) {
         case conn_max_state:
             assert(false);
             break;
-#else
+#else /* IO_URING */
         case conn_listening:
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
@@ -3577,8 +3513,8 @@ void drive_machine(conn *c) {
                         }
                     }
                 }
-                ssl_v = (void*) ssl;
 #endif
+                ssl_v = (void*) ssl;
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
@@ -3588,9 +3524,6 @@ void drive_machine(conn *c) {
 
         case conn_waiting:
             rbuf_release(c);
-#ifdef IO_URING
-            conn_set_state(c, conn_read);
-#else
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
                     fprintf(stderr, "Couldn't update event\n");
@@ -3599,13 +3532,9 @@ void drive_machine(conn *c) {
             }
             conn_set_state(c, conn_read);
             stop = true;
-#endif
             break;
 
         case conn_read:
-#ifdef IO_URING
-            if (!c->wait_cqe) {
-#endif
             if (!IS_UDP(c->transport)) {
                 // Assign a read buffer if necessary.
                 if (!rbuf_alloc(c)) {
@@ -3618,12 +3547,6 @@ void drive_machine(conn *c) {
                 // UDP connections always have a static buffer.
                 res = try_read_udp(c);
             }
-#ifdef IO_URING
-            stop = true;
-            } else {
-            res = try_read_network(c);
-            c->wait_cqe = false;
-#endif
             switch (res) {
             case READ_NO_DATA_RECEIVED:
                 conn_set_state(c, conn_waiting);
@@ -3638,9 +3561,6 @@ void drive_machine(conn *c) {
                 /* State already set by try_read_network */
                 break;
             }
-#ifdef IO_URING
-            }
-#endif
             break;
 
         case conn_parse_cmd:
@@ -3678,33 +3598,18 @@ void drive_machine(conn *c) {
                        hack we should just put in a request to write data,
                        because that should be possible ;-)
                     */
-#ifdef IO_URING
-                    sqe = io_uring_get_sqe(c->thread->ring);
-                    io_uring_prep_poll_add(sqe, c->sfd, POLLOUT);
-                    io_uring_sqe_set_data(sqe, c);
-#else
                     if (!update_event(c, EV_WRITE | EV_PERSIST)) {
                         if (settings.verbose > 0)
                             fprintf(stderr, "Couldn't update event\n");
                         conn_set_state(c, conn_closing);
                         break;
                     }
-#endif
                 }
-#ifdef IO_URING
-                else {
-                    rbuf_release(c);
-                    conn_set_state(c, conn_read);
-                }
-#endif
                 stop = true;
             }
             break;
 
         case conn_nread:
-#ifdef IO_URING
-            if (!c->wait_cqe) {
-#endif
             if (c->rlbytes == 0) {
                 complete_nread(c);
                 break;
@@ -3734,14 +3639,6 @@ void drive_machine(conn *c) {
                 }
 
                 /*  now try reading from the socket */
-#ifdef IO_URING
-                sqe = io_uring_get_sqe(c->thread->ring);
-                io_uring_prep_read(sqe, c->sfd, c->ritem, c->rlbytes, 0);
-                io_uring_sqe_set_data(sqe, c);
-                c->wait_cqe = true;
-                stop = true;
-                break;
-#else
                 res = c->read(c, c->ritem, c->rlbytes);
                 if (res > 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3754,37 +3651,16 @@ void drive_machine(conn *c) {
                     c->rlbytes -= res;
                     break;
                 }
-#endif
             } else {
                 res = read_into_chunked_item(c);
                 if (res > 0)
                     break;
             }
-#ifdef IO_URING
-            } else {
-            c->wait_cqe = false;
-            res = c->cqe->res;
-
-            if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                if (c->rcurr == c->ritem) {
-                    c->rcurr += res;
-                }
-                c->ritem += res;
-                c->rlbytes -= res;
-                break;
-            }
-#endif
-
             if (res == 0) { /* end of stream */
                 c->close_reason = NORMAL_CLOSE;
                 conn_set_state(c, conn_closing);
                 break;
             }
-
-#ifndef IO_URING
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (!update_event(c, EV_READ | EV_PERSIST)) {
                     if (settings.verbose > 0)
@@ -3795,8 +3671,6 @@ void drive_machine(conn *c) {
                 stop = true;
                 break;
             }
-#endif
-
             /* Memory allocation failure */
             if (res == -2) {
                 out_of_memory(c, "SERVER_ERROR Out of memory during read");
@@ -3820,9 +3694,6 @@ void drive_machine(conn *c) {
             }
             conn_set_state(c, conn_closing);
             break;
-#ifdef IO_URING
-            }
-#endif
 
         case conn_swallow:
             /* we are reading sbytes and throwing them away */
@@ -3872,9 +3743,6 @@ void drive_machine(conn *c) {
 
         case conn_write:
         case conn_mwrite:
-#ifdef IO_URING
-            if (!c->wait_cqe) {
-#endif
             /* have side IO's that must process before transmit() can run.
              * remove the connection from the worker thread and dispatch the
              * IO queue
@@ -3894,15 +3762,7 @@ void drive_machine(conn *c) {
                 stop = true;
                 break;
             }
-#ifdef IO_URING
-            transmit(c);
-            stop = true;
-            break;
-            } else {
-            switch (transmit(c)) {
-#else
             switch (!IS_UDP(c->transport) ? transmit(c) : transmit_udp(c)) {
-#endif
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
                     // Free up IO wraps and any half-uploaded items.
@@ -3926,9 +3786,6 @@ void drive_machine(conn *c) {
                 stop = true;
                 break;
             }
-#ifdef IO_URING
-            }
-#endif
             break;
 
         case conn_closing:

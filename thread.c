@@ -539,7 +539,6 @@ static void *worker_libevent(void *arg) {
                             IORING_SETUP_DEFER_TASKRUN |
                             IORING_SETUP_COOP_TASKRUN);
 
-#ifdef MULTISHOT
     int ret;
 
     if (posix_memalign((void **)&(me->buf), 4096, NR_BUFS * BUF_SIZE)) {
@@ -564,7 +563,6 @@ static void *worker_libevent(void *arg) {
     io_uring_buf_ring_advance(me->br, NR_BUFS);
 
     LOG("registered ring provided buffers\n");
-#endif
 
     LOG("adding polling events for wakeup pipe\n");
     sqe = io_uring_get_sqe(&ring);
@@ -602,7 +600,7 @@ static void *worker_libevent(void *arg) {
                         thread_libevent_process(me->n.notify_event_fd, 0, me);
                     } else {
                         c = (conn *)cqe->user_data;
-#ifdef MULTISHOT
+#ifdef IO_URING
                         if (cqe->flags & IORING_CQE_F_BUFFER) {
                             LOG("multishot recv\n");
                             c->cqes[c->h] = cqe;
@@ -620,10 +618,6 @@ static void *worker_libevent(void *arg) {
                             c->cqe = cqe;
                             drive_machine(c);
                         }
-#else
-                        LOG("socket (read|sendmsg)\n");
-                        c->cqe = cqe;
-                        drive_machine(c);
 #endif
                     }
                 }
@@ -642,7 +636,7 @@ static void *worker_libevent(void *arg) {
 
     LOG("thread exiting\n");
 
-#ifdef MULTISHOT
+#ifdef IO_URING
     io_uring_free_buf_ring(me->ring, me->br, NR_BUFS, BGID);
 #endif
 
@@ -756,7 +750,6 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     c->thread = me;
                     conn_io_queue_setup(c);
 #ifdef IO_URING
-#ifdef MULTISHOT
                     for (int i = 0; i < NCQES; ++i) {
                         c->cqes[i] = NULL;
                     }
@@ -769,10 +762,6 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     io_uring_sqe_set_data(sqe, c);
                     sqe->buf_group = BGID;
                     sqe->flags |= IOSQE_BUFFER_SELECT;
-#endif
-#ifndef MULTISHOT
-                    drive_machine(c);
-#endif
 #endif
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
