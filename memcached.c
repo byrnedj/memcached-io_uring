@@ -3353,8 +3353,10 @@ void drive_machine(conn *c) {
 #endif
                     c->ritem += res;
                     c->rlbytes -= res;
+#ifdef IO_URING
 		    c->t = (c->t + 1) % NCQES;
 		    c->p++;
+#endif // IO_URING
                     break;
                 }
             } else {
