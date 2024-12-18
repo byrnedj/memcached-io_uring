@@ -105,6 +105,9 @@ AC_ARG_ENABLE(seccomp,
 AC_ARG_ENABLE(sasl,
   [AS_HELP_STRING([--enable-sasl],[Enable SASL authentication])])
 
+AC_ARG_ENABLE(uring,
+  [AS_HELP_STRING([--enable-uring],[Enable IO_URING based event loop])])
+
 AC_ARG_ENABLE(sasl_pwdb,
   [AS_HELP_STRING([--enable-sasl-pwdb],[Enable plaintext password db])])
 
@@ -197,6 +200,13 @@ if test "x$enable_sasl" = "xyes"; then
                    [Set to nonzero if you want to enable a SASL pwdb])])
 fi
 
+AC_ARG_ENABLE(uring,
+  [AS_HELP_STRING([--enable-uring],[Enable io_uring multishot based event loop])])
+if test "x$enable_uring" = "xyes"; then
+	AC_DEFINE([IO_URING], 1,
+		   [Set to nonzero if you want to enable io_uring based event loop])
+fi
+
 AC_ARG_ENABLE(dtrace,
   [AS_HELP_STRING([--enable-dtrace],[Enable dtrace probes])])
 if test "x$enable_dtrace" = "xyes"; then
@@ -262,6 +272,7 @@ fi
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
+AM_CONDITIONAL([ENABLE_URING],[test "$enable_uring" = "yes"])
 AM_CONDITIONAL([ENABLE_EXTSTORE],[test "$enable_extstore" != "no"])
 AM_CONDITIONAL([ENABLE_ARM_CRC32],[test "$enable_arm_crc32" = "yes"])
 AM_CONDITIONAL([ENABLE_TLS],[test "$enable_tls" = "yes"])
@@ -369,7 +380,7 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
   le_found=no
   for ledir in $trylibeventdir "" $prefix /usr/local ; do
     LDFLAGS="$saved_LDFLAGS"
-    LIBS="-levent -luring $saved_LIBS"
+    LIBS="-levent $saved_LIBS"
 
     # Skip the directory if it isn't there.
     if test ! -z "$ledir" -a ! -d "$ledir" ; then
@@ -417,7 +428,7 @@ AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
 ])
   fi
 ])
-LIBS="-levent $LIBS"
+LIBS="-levent -luring $LIBS"
 if test $ac_cv_libevent_dir != "(system)"; then
   if test -d "$ac_cv_libevent_dir/lib" ; then
     LDFLAGS="-L$ac_cv_libevent_dir/lib $LDFLAGS"
