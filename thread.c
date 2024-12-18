@@ -600,7 +600,6 @@ static void *worker_libevent(void *arg) {
                         thread_libevent_process(me->n.notify_event_fd, 0, me);
                     } else {
                         c = (conn *)cqe->user_data;
-#ifdef IO_URING
                         if (cqe->flags & IORING_CQE_F_BUFFER) {
                             LOG("multishot recv\n");
                             c->cqes[c->h] = cqe;
@@ -618,7 +617,6 @@ static void *worker_libevent(void *arg) {
                             c->cqe = cqe;
                             drive_machine(c);
                         }
-#endif
                     }
                 }
 
