@@ -1475,9 +1475,7 @@ static void reset_cmd_handler(conn *c) {
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
     } else {
-#ifdef IO_URING
         conn_set_state(c, conn_waiting);
-#endif
     }
 }
 
