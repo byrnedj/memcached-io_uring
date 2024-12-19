@@ -1,3 +1,9 @@
+# Memcached + io_uring 
+
+This repository contains memcached patched to use io_uring instead of epoll in event loop.
+
+Some experimental results are available here: https://git.uwaterloo.ca/lseo/io_uring-experiments
+
 # Memcached
 
 Memcached is a high performance multithreaded event-based key/value cache
