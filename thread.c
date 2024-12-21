@@ -555,7 +555,7 @@ static void *worker_libevent(void *arg) {
         exit(1);
     }
 
-    void* ptr = me->buf;
+    char* ptr = me->buf;
     for (int i = 0; i < NR_BUFS; ++i) {
         io_uring_buf_ring_add(me->br, ptr, BUF_SIZE, i, BR_MASK, i);
         ptr += BUF_SIZE;
@@ -578,7 +578,6 @@ static void *worker_libevent(void *arg) {
     conn *c;
     unsigned head;
     unsigned n=80;
-    unsigned nb;
 
     while (1) {
         // TODO: automatically adjust timeout & batchsize
@@ -604,7 +603,6 @@ static void *worker_libevent(void *arg) {
                             LOG("multishot recv\n");
                             c->cqes[c->h] = cqe;
                             c->h = (c->h + 1) % NCQES;
-                            nb = ++c->l;
                             if (c->wait_rcqe) {
                                 c->p = 0;
                                 drive_machine(c);

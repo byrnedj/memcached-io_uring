@@ -145,7 +145,9 @@ ssize_t tcp_write(conn *c, void *buf, size_t count) {
     return write(c->sfd, buf, count);
 }
 
+#ifndef IO_URING
 static enum transmit_result transmit(conn *c);
+#endif // IO_URING
 
 /* This reduces the latency without adding lots of extra wiring to be able to
  * notify the listener thread of when to listen again.
@@ -1456,6 +1458,7 @@ void append_stats(const char *key, const uint16_t klen,
     assert(c->stats.offset <= c->stats.size);
 }
 
+#ifndef IO_URING
 static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
@@ -1478,6 +1481,7 @@ static void reset_cmd_handler(conn *c) {
         conn_set_state(c, conn_waiting);
     }
 }
+#endif // IO_URING
 
 static void complete_nread(conn *c) {
     assert(c != NULL);
@@ -2734,10 +2738,9 @@ static void _transmit_post(conn *c, ssize_t res) {
  *   TRANSMIT_SOFT_ERROR Can't write any more right now.
  *   TRANSMIT_HARD_ERROR Can't write (c->state is set to conn_closing)
  */
+#ifndef IO_URING
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
-    struct iovec iovs[IOV_MAX];
-    struct msghdr msg;
     int iovused = 0;
 
     // init the msg.
@@ -2788,7 +2791,9 @@ static enum transmit_result transmit(conn *c) {
     conn_set_state(c, conn_closing);
     return TRANSMIT_HARD_ERROR;
 }
+#endif // IO_URING
 
+#ifndef IO_URING
 static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
     // We need to communicate the total number of packets
     // If this isn't set, it's the first time this response is building a udp
@@ -2818,6 +2823,7 @@ static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
     *hdr++ = 0;
     resp->udp_sequence++;
 }
+#endif // IO_URING
 
 /*
  * UDP specific transmit function. Uses its own function rather than check
@@ -2831,6 +2837,7 @@ static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
  *   TRANSMIT_SOFT_ERROR Can't write any more right now.
  *   TRANSMIT_HARD_ERROR Can't write (c->state is set to conn_closing)
  */
+#ifndef IO_URING
 static enum transmit_result transmit_udp(conn *c) {
     assert(c != NULL);
     struct iovec iovs[IOV_MAX];
@@ -2927,6 +2934,7 @@ static enum transmit_result transmit_udp(conn *c) {
     conn_set_state(c, conn_read);
     return TRANSMIT_HARD_ERROR;
 }
+#endif // IO_URING
 
 
 /* Does a looped read to fill data chunks */
@@ -3017,16 +3025,14 @@ void drive_machine(conn *c) {
     int sfd;
     socklen_t addrlen;
     struct sockaddr_storage addr;
+#ifndef IO_URING
     int nreqs = settings.reqs_per_event;
+#endif // IO_URING
     int res;
     const char *str;
 #ifdef IO_URING
     enum transmit_result sentdata;
     struct io_uring_sqe *sqe;
-
-    // parameters for the inlined transmit
-    struct iovec iovs[IOV_MAX];
-    struct msghdr msg;
     int iovused = 0;
 #endif
 #ifdef HAVE_ACCEPT4
