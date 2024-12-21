@@ -2741,6 +2741,9 @@ static void _transmit_post(conn *c, ssize_t res) {
 #ifndef IO_URING
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
+    struct iovec iovs[IOV_MAX];
+    struct msghdr msg;
+
     int iovused = 0;
 
     // init the msg.
