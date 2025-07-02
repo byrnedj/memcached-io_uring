@@ -577,7 +577,7 @@ static void *worker_libevent(void *arg) {
     struct io_uring_cqe *cqe;
     conn *c;
     unsigned head;
-    unsigned n=80;
+    unsigned n= 80;
 
     while (1) {
         // TODO: automatically adjust timeout & batchsize
@@ -621,7 +621,9 @@ static void *worker_libevent(void *arg) {
                 ++n;
             }
             io_uring_cq_advance(&ring, n);
-            LOG("processed %d CQEs\n", n);
+            if (n > 0) {
+              LOG("processed %d CQEs\n", n);
+            }
         } else {
             LOG("io_uring_submit_and_wait_timeout failed\n");
         }

@@ -81,7 +81,7 @@
 #define INCR_MAX_STORAGE_LEN 24
 
 #define WRITE_BUFFER_SIZE 1024
-#define READ_BUFFER_SIZE 16384
+#define READ_BUFFER_SIZE 32*1024
 #define READ_BUFFER_CACHED 0
 #define UDP_READ_BUFFER_SIZE 65536
 #define UDP_MAX_PAYLOAD_SIZE 1400
@@ -723,9 +723,9 @@ struct thread_notify {
 #ifdef IO_URING
 #define BGID 1
 // probably too big
-#define BUF_SIZE 4096
+#define BUF_SIZE 65536 // 1MB
 // needs to be power of 2
-#define NR_BUFS 512
+#define NR_BUFS 32
 #define BR_MASK (NR_BUFS - 1)
 #endif
 
@@ -1124,7 +1124,7 @@ extern void drop_worker_privileges(void);
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
-
+#define DLOG 1
 #ifdef DLOG
 #define LOG(...) printf(__VA_ARGS__)
 #else

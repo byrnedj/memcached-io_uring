@@ -3240,7 +3240,7 @@ void drive_machine(conn *c) {
                 LOG("tail: %d\n", c->t);
                 LOG("bid: %d\n", bid);
                 LOG("length: %d\n", len);
-                LOG("content: %.*s\n", c->cqes[c->t]->res, c->thread->buf + BUF_SIZE * bid);
+                //LOG("content: %.*s\n", c->cqes[c->t]->res, c->thread->buf + BUF_SIZE * bid);
                 //c->rbuf = c->thread->buf + BUF_SIZE * bid;
                 if (c->rbuf != c->rcurr) {
                     memmove(c->rbuf, c->rcurr, c->rbytes);
@@ -3337,9 +3337,11 @@ void drive_machine(conn *c) {
 		    int bid = c->cqes[c->t]->flags >> IORING_CQE_BUFFER_SHIFT;
 		    int len = c->cqes[c->t]->res;
 
-		    if (len > c->rlbytes) {
+		    if (len >= c->rlbytes) {
+                        LOG("copy from uring buf %d bytes\n", len - c->rlbytes);
 		        memcpy(c->rbuf, c->thread->buf + BUF_SIZE * bid + c->rlbytes, len - c->rlbytes);
 			c->rcurr = c->rbuf;
+                        LOG("copy to ritem %d bytes\n", c->rlbytes);
 			memcpy(c->ritem, c->thread->buf + BUF_SIZE * bid, c->rlbytes);
 			res = c->rlbytes;
 		    } else {
