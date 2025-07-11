@@ -1600,6 +1600,9 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
     // we have the full status code and item data.
     c->mset_res = true;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, c->rlbytes);
+    //}
     return;
 error:
     /* swallow the data line */
@@ -2095,6 +2098,9 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->rlbytes = it->nbytes;
     c->cmd = comm;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, c->rlbytes);
+    //}
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {

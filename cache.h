@@ -2,6 +2,7 @@
 #ifndef CACHE_H
 #define CACHE_H
 #include <pthread.h>
+#include <stdbool.h>
 #include "queue.h"
 
 #ifndef NDEBUG
@@ -12,6 +13,12 @@ extern int cache_error;
 struct cache_free_s {
     STAILQ_ENTRY(cache_free_s) c_next;
 };
+
+/* Allocation header to track memory type for proper deallocation */
+typedef struct cache_alloc_header_s {
+    size_t size;      /* Size of allocation (needed for munmap) */
+    bool is_mmap;     /* True if allocated with mmap (hugepages) */
+} cache_alloc_header_t;
 
 //typedef STAILQ_HEAD(cache_head_s, cache_free_s) cache_head_t;
 /**
@@ -36,6 +43,14 @@ typedef struct {
     int freecurr;
     /** A limit on the total number of elements */
     int limit;
+    /** Pre-allocated hugepage pool for objects */
+    void *pool_base;
+    /** Size of the pre-allocated pool */
+    size_t pool_size;
+    /** Current position in pool for carving new objects */
+    char *pool_current;
+    /** Whether pool was allocated with mmap (hugepages) */
+    bool pool_is_mmap;
 } cache_t;
 
 /**

@@ -30,7 +30,8 @@ memcached_SOURCES = memcached.c memcached.h \
                     authfile.c authfile.h \
                     restart.c restart.h \
                     proto_text.c proto_text.h \
-                    proto_bin.c proto_bin.h
+                    proto_bin.c proto_bin.h \
+                    hugepage.c hugepage.h
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
@@ -86,11 +87,11 @@ memcached_SOURCES += tls.c tls.h
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
-memcached_CPPFLAGS = -DNDEBUG
-memcached_debug_LDADD = @PROFILER_LDFLAGS@
+memcached_CPPFLAGS = -DNDEBUG -DMEMCACHED_MAIN
+memcached_debug_LDADD = @PROFILER_LDFLAGS@ -luring -ldto
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
 
-memcached_LDADD =
+memcached_LDADD = -luring -ldto
 memcached_LDFLAGS =
 memcached_debug_LDFLAGS =
 memcached_DEPENDENCIES =

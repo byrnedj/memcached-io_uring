@@ -27,6 +27,8 @@
 #include <sys/uio.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <linux/io_uring.h>
+#include <liburing.h>
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -64,7 +66,6 @@
 /*
  * forward declarations
  */
-static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
 static ssize_t tcp_sendmsg(conn *arg, struct msghdr *msg, int flags);
@@ -214,6 +215,10 @@ void stats_reset(void) {
 }
 
 static void settings_init(void) {
+    settings.use_io_uring = false;
+    settings.use_io_uring_registered_buffers = false;
+    settings.io_uring_depth = 1024; /* default io_uring depth */
+    settings.io_uring_buf_count = 1024; /* default number of registered buffers (32 * 1MB = 32MB per thread) */
     settings.use_cas = true;
     settings.access = 0700;
     settings.port = 11211;
@@ -275,6 +280,10 @@ static void settings_init(void) {
 #endif
     settings.num_napi_ids = 0;
     settings.memory_file = NULL;
+    /* Huge page settings */
+    settings.use_hugepages = false;
+    settings.hugepage_thp_fallback = true;
+    settings.hugepage_size = 0;  /* 0 = auto-detect best size */
 #ifdef SOCK_COOKIE_ID
     settings.sock_cookie_id = 0;
 #endif
@@ -609,7 +618,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base, void *ssl, uint64_t conntag,
-                enum protocol bproto) {
+                enum protocol bproto, bool use_io_uring) {
     conn *c;
 
     assert(sfd >= 0 && sfd < max_fds);
@@ -768,20 +777,21 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
-
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
+    if (!use_io_uring) {
+        event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+        event_base_set(base, &c->event);
+        c->ev_flags = event_flags;
+        if (event_add(&c->event, 0) == -1) {
+            perror("event_add");
+            return NULL;
+        }
     }
+
 
     STATS_LOCK();
     stats_state.curr_conns++;
     stats.total_conns++;
     STATS_UNLOCK();
-
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
     return c;
@@ -873,7 +883,9 @@ static void conn_close(conn *c) {
     }
 
     /* delete the event, the socket and the conn */
-    event_del(&c->event);
+    if (!settings.use_io_uring) {
+        event_del(&c->event);
+    }
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -1412,11 +1424,16 @@ static void reset_cmd_handler(conn *c) {
         c->item = NULL;
     }
     if (c->rbytes > 0) {
+        /* With io_uring, we often read multiple pipelined commands at once,
+         * so having rbytes > 0 here is normal. Continue parsing. */
         conn_set_state(c, conn_parse_cmd);
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
     } else {
         conn_set_state(c, conn_waiting);
+        //if (settings.use_io_uring) {
+        //    queue_recv(c, NULL, 0);
+        //}
     }
 }
 
@@ -2953,7 +2970,167 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
-static void drive_machine(conn *c) {
+static void recv_complete(struct io_uring_op_ctx *op, int res, unsigned int cqe_flags)
+{
+    conn *c = op->c;
+    int buf_id = -1;
+
+    // Extract buffer ID from CQE flags if using provided buffers
+    if (op->using_provided_buf && (cqe_flags & IORING_CQE_F_BUFFER)) {
+        buf_id = cqe_flags >> IORING_CQE_BUFFER_SHIFT;
+        c->thread->buf_selected++;
+    }
+
+    //res > 0 means we read data, that means we should go to
+    //conn_parse_cmd state
+    if (res > 0) {
+        // If using provided buffers, copy data from provided buffer to connection buffer
+        if (buf_id >= 0 && settings.use_io_uring_registered_buffers) {
+            char *provided_buf = io_uring_buf_get_ptr(c->thread, buf_id);
+
+            if (c->state == conn_nread) {
+                // For conn_nread, copy to ritem
+                if (c->rcurr == c->ritem) {
+                    c->rcurr += res;
+                }
+                memcpy(c->ritem, provided_buf, res);
+                c->ritem += res;
+                c->rlbytes -= res;
+            } else {
+                // For other states, copy to rbuf
+                size_t space_available = c->rsize - c->rbytes;
+                size_t copy_bytes = res < space_available ? res : space_available;
+                memcpy(c->rcurr + c->rbytes, provided_buf, copy_bytes);
+                c->rbytes += copy_bytes;
+                conn_set_state(c, conn_parse_cmd);
+            }
+
+            // Recycle the provided buffer back to the ring
+            io_uring_buf_recycle(c->thread, buf_id);
+
+            if (settings.verbose > 2) {
+                fprintf(stderr, "Copied %d bytes from provided buffer %d to connection buffer\n",
+                        res, buf_id);
+            }
+        } else {
+            // Regular recv path (no provided buffers)
+            if (c->state == conn_nread) {
+                if (c->rcurr == c->ritem) {
+                    c->rcurr += res;
+                }
+                c->ritem += res;
+                c->rlbytes -= res;
+            } else {
+                c->rbytes += res;
+                conn_set_state(c, conn_parse_cmd);
+            }
+        }
+
+        if (settings.verbose > 2) {
+            const char *state = state_text(c->state);
+            fprintf(stderr, "Received %d bytes on fd %d, remain %d, state %s\n", res, c->sfd, c->rlbytes, state);
+        }
+    } else if (res == 0) {           /* peer closed cleanly */
+        // Recycle provided buffer if it was allocated
+        if (buf_id >= 0 && settings.use_io_uring_registered_buffers) {
+            io_uring_buf_recycle(c->thread, buf_id);
+        }
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+    } else {                         /* res < 0  ⇒  -errno   */
+        // Recycle provided buffer if it was allocated (note: on error, buffer may not have been selected)
+        if (buf_id >= 0 && settings.use_io_uring_registered_buffers) {
+            io_uring_buf_recycle(c->thread, buf_id);
+        }
+        errno = -res;
+
+        // Log error details for debugging
+        if (settings.verbose > 0) {
+            fprintf(stderr, "recv error on fd %d: %s (%d), buf_id=%d, using_provided_buf=%d, "
+                    "selected=%lu recycled=%lu diff=%ld\n",
+                    c->sfd, strerror(-res), -res, buf_id, op->using_provided_buf,
+                    c->thread->buf_selected, c->thread->buf_recycled,
+                    (long)(c->thread->buf_selected - c->thread->buf_recycled));
+        }
+
+        // Handle buffer exhaustion: re-queue recv instead of closing
+        if (-res == ENOBUFS && op->using_provided_buf) {
+            if (settings.verbose > 0) {
+                fprintf(stderr, "No provided buffers available on fd %d, re-queuing recv\n", c->sfd);
+            }
+            do_cache_free(c->thread->io_uring_cache, op);
+            queue_recv(c, NULL, 0);
+            return;
+        }
+
+        conn_set_state(c, conn_closing);
+    }
+
+    if (c) {
+        do_cache_free(c->thread->io_uring_cache, op);
+    }
+    drive_machine(c);
+}
+
+
+void queue_recv(conn *c, void* buf, size_t len)
+{
+    //todo make this a thread local allocator like rbuf_cache
+    struct io_uring_op_ctx *op = do_cache_alloc(c->thread->io_uring_cache);
+    if (!op) {
+        fprintf(stderr, "Failed to allocate io_uring_op_ctx for recv operation.\n");
+        exit(EXIT_FAILURE);
+    }
+    op->c       = c;
+    op->type    = OP_RECV;
+    op->handler = recv_complete;
+    op->using_provided_buf = false;  // Default: not using provided buffers
+
+    struct io_uring_sqe *sqe =
+        io_uring_get_sqe(c->thread->ring);  /* ring is per worker */
+
+    if (buf == NULL) {
+        rbuf_alloc(c); /* ensure rbuf is allocated */
+
+        /* If we have unconsumed data and rcurr is not at the start of the buffer,
+         * move the unconsumed data to the beginning to make room for new data */
+        if (c->rbytes > 0 && c->rcurr != c->rbuf) {
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+            c->rcurr = c->rbuf;
+        }
+
+        /* Calculate how much space is available in the buffer.
+         * We read into the buffer starting after any unconsumed bytes */
+        size_t space_available = c->rsize - c->rbytes;
+        len = space_available;
+
+        // Use provided buffers if enabled
+        if (settings.use_io_uring_registered_buffers && c->thread->buf_ring) {
+            // Use provided buffers: kernel selects buffer from ring
+            // Limit recv size to available space in connection buffer to avoid data loss
+            size_t max_recv = space_available < IO_URING_REGISTERED_BUFFER_SIZE
+                              ? space_available : IO_URING_REGISTERED_BUFFER_SIZE;
+            op->using_provided_buf = true;
+            io_uring_prep_recv(sqe, c->sfd, NULL, max_recv, 0);
+            sqe->flags |= IOSQE_BUFFER_SELECT;
+            sqe->buf_group = c->thread->io_uring_bgid;
+            if (settings.verbose > 2) {
+                fprintf(stderr, "Queued recv with provided buffers on fd %d, bgid %d, max_recv %zu\n",
+                        c->sfd, c->thread->io_uring_bgid, max_recv);
+            }
+        } else {
+            io_uring_prep_recv(sqe, c->sfd, c->rcurr + c->rbytes, space_available, 0);
+        }
+    } else {
+        io_uring_prep_recv(sqe, c->sfd, buf, len, 0);
+    }
+
+    io_uring_sqe_set_data(sqe, op);          /* attaches context  */
+}
+
+
+
+void drive_machine(conn *c) {
     bool stop = false;
     int sfd;
     socklen_t addrlen;
@@ -2973,6 +3150,9 @@ static void drive_machine(conn *c) {
 
         switch(c->state) {
         case conn_listening:
+            //if (settings.use_io_uring) {
+            //    fprintf(stderr, "Cannot accept new connections with io_uring enabled (tid: %d).\n", pthread_self());
+            //} else {
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
@@ -3045,18 +3225,24 @@ static void drive_machine(conn *c) {
 
         case conn_waiting:
             rbuf_release(c);
-            if (!update_event(c, EV_READ | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
-                conn_set_state(c, conn_closing);
-                break;
+            if (settings.use_io_uring) {
+                // If we use io_uring, we can queue a recv operation.
+                queue_recv(c, NULL, 0);
+            } else {
+                // Otherwise, we need to update the event to read.
+                if (!update_event(c, EV_READ | EV_PERSIST)) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+                conn_set_state(c, conn_read);
             }
-
-            conn_set_state(c, conn_read);
             stop = true;
             break;
 
         case conn_read:
+            assert(settings.use_io_uring == false);
             if (!IS_UDP(c->transport)) {
                 // Assign a read buffer if necessary.
                 if (!rbuf_alloc(c)) {
@@ -3160,7 +3346,14 @@ static void drive_machine(conn *c) {
                         break;
                     }
                 }
-
+                if (settings.use_io_uring) {
+		    if (settings.verbose > 2) {
+	                 fprintf(stderr, "queieng recv for %d\n", c->rlbytes);
+		    }
+                    queue_recv(c, c->ritem, c->rlbytes);
+                    stop = true;
+                    break;
+                }
                 /*  now try reading from the socket */
                 res = c->read(c, c->ritem, c->rlbytes);
                 if (res > 0) {
@@ -3599,7 +3792,7 @@ static int server_socket(const char *interface,
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
+                                             transport, main_base, NULL, conntag, bproto, false))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -3873,7 +4066,8 @@ static int server_socket_unix(const char *path, int access_mask) {
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
+                                 local_transport, main_base, NULL, 0, settings.binding_protocol,
+                                 false))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
@@ -4747,6 +4941,9 @@ int main (int argc, char **argv) {
         DROP_PRIVILEGES,
         RESP_OBJ_MEM_LIMIT,
         READ_BUF_MEM_LIMIT,
+        HUGEPAGES,
+        NO_HUGEPAGES,
+        HUGEPAGE_SIZE,
 #ifdef TLS
         SSL_CERT,
         SSL_KEY,
@@ -4811,6 +5008,9 @@ int main (int argc, char **argv) {
         [DROP_PRIVILEGES] = "drop_privileges",
         [RESP_OBJ_MEM_LIMIT] = "resp_obj_mem_limit",
         [READ_BUF_MEM_LIMIT] = "read_buf_mem_limit",
+        [HUGEPAGES] = "hugepages",
+        [NO_HUGEPAGES] = "no_hugepages",
+        [HUGEPAGE_SIZE] = "hugepage_size",
 #ifdef TLS
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
@@ -4893,6 +5093,10 @@ int main (int argc, char **argv) {
           "b:"  /* backlog queue limit */
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
+          "O"   /* Enable io_uring */
+          "Q:"  /* io_uring_q_depth */
+          "G"   /* Enable io_uring registered buffers */
+          "H:"  /* io_uring registered buffer count */
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
@@ -4934,6 +5138,10 @@ int main (int argc, char **argv) {
         {"listen-backlog", required_argument, 0, 'b'},
         {"protocol", required_argument, 0, 'B'},
         {"max-item-size", required_argument, 0, 'I'},
+        {"enable-io-uring", no_argument, 0, 'O'},
+        {"io-uring-depth", required_argument, 0, 'Q'},
+        {"enable-io-uring-registered-buffers", no_argument, 0, 'G'},
+        {"io-uring-buffer-count", required_argument, 0, 'H'},
         {"enable-sasl", no_argument, 0, 'S'},
         {"disable-flush-all", no_argument, 0, 'F'},
         {"disable-dumping", no_argument, 0, 'X'},
@@ -5018,6 +5226,22 @@ int main (int argc, char **argv) {
             exit(EXIT_SUCCESS);
         case 'k':
             lock_memory = true;
+            break;
+        case 'O':
+            settings.use_io_uring = true;
+            break;
+        case 'Q':
+            settings.io_uring_depth = atoi(optarg);
+            break;
+        case 'G':
+            settings.use_io_uring_registered_buffers = true;
+            break;
+        case 'H':
+            settings.io_uring_buf_count = atoi(optarg);
+            if (settings.io_uring_buf_count <= 0) {
+                fprintf(stderr, "Invalid io_uring buffer count: %d\n", settings.io_uring_buf_count);
+                return 1;
+            }
             break;
         case 'v':
             settings.verbose++;
@@ -5105,6 +5329,7 @@ int main (int argc, char **argv) {
         case 'L' :
             if (enable_large_pages() == 0) {
                 preallocate = true;
+                settings.use_hugepages = true;
             } else {
                 fprintf(stderr, "Cannot enable large pages on this system\n"
                     "(There is no support as of this version)\n");
@@ -5557,6 +5782,28 @@ int main (int argc, char **argv) {
                 }
                 settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
                 break;
+            case HUGEPAGES:
+                settings.use_hugepages = true;
+                break;
+            case NO_HUGEPAGES:
+                settings.use_hugepages = false;
+                break;
+            case HUGEPAGE_SIZE:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing hugepage_size argument\n");
+                    goto error;
+                }
+                if (!safe_strtol(subopts_value, &settings.hugepage_size)) {
+                    fprintf(stderr, "could not parse argument to hugepage_size\n");
+                    goto error;
+                }
+                /* Accept 0 (auto), 2 (2MB), or 1024 (1GB) */
+                if (settings.hugepage_size != 0 && settings.hugepage_size != 2 &&
+                    settings.hugepage_size != 1024) {
+                    fprintf(stderr, "hugepage_size must be 0 (auto), 2 (2MB), or 1024 (1GB)\n");
+                    goto error;
+                }
+                break;
 #ifdef PROXY
             case PROXY_CONFIG:
                 if (subopts_value == NULL) {
@@ -5743,6 +5990,11 @@ int main (int argc, char **argv) {
         }
     }
 
+    if (settings.use_io_uring_registered_buffers && !settings.use_io_uring) {
+        fprintf(stderr, "ERROR: io_uring registered buffers require io_uring to be enabled (-O flag).\n");
+        exit(EX_USAGE);
+    }
+
     if (udp_specified && settings.udpport != 0 && !tcp_specified) {
         settings.port = settings.udpport;
     }
@@ -5913,6 +6165,11 @@ int main (int argc, char **argv) {
 
     /* initialize other stuff */
     stats_init();
+
+    /* Set hugepage verbosity level */
+    extern int verbose_hugepage;
+    verbose_hugepage = settings.verbose;
+
     logger_init();
     logger_create(); // main process logger
     conn_init();

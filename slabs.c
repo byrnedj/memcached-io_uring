@@ -6,6 +6,9 @@
  * a multiplier factor from there, up to half the maximum slab size.
  */
 #include "memcached.h"
+#include "hugepage.h"
+#include <dto.h>
+#include <linux/mman.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -92,61 +95,34 @@ unsigned int slabs_size(const int clsid) {
 // TODO: could this work with the restartable memory?
 // Docs say hugepages only work with private shm allocs.
 /* Function split out for better error path handling */
+
+/* Static storage for the main slab allocation metadata */
+static hugepage_alloc_t slab_hugepage_alloc;
+
 static void * alloc_large_chunk(const size_t limit)
 {
     void *ptr = NULL;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    size_t pagesize = 0;
-    FILE *fp;
-    int ret;
+    unsigned int flags = HUGEPAGE_FLAG_PREFAULT;
 
-    /* Get the size of huge pages */
-    fp = fopen("/proc/meminfo", "r");
-    if (fp != NULL) {
-        char buf[64];
-
-        while ((fgets(buf, sizeof(buf), fp)))
-            if (!strncmp(buf, "Hugepagesize:", 13)) {
-                ret = sscanf(buf + 13, "%zu\n", &pagesize);
-
-                /* meminfo huge page size is in KiBs */
-                pagesize <<= 10;
-            }
-        fclose(fp);
+    /* Build allocation flags based on settings */
+    if (settings.use_hugepages) {
+        flags |= HUGEPAGE_FLAG_THP_FALLBACK;
     }
+    flags |= HUGEPAGE_FLAG_MALLOC_FALLBACK;
 
-    if (!pagesize) {
-        fprintf(stderr, "Failed to get supported huge page size\n");
+    ptr = hugepage_alloc(limit, flags, &slab_hugepage_alloc);
+
+    if (ptr == NULL) {
+        fprintf(stderr, "Failed to allocate %zu bytes for slab memory\n", limit);
         return NULL;
     }
 
-    if (settings.verbose > 1)
-        fprintf(stderr, "huge page size: %zu\n", pagesize);
-
-    /* This works because glibc simply uses mmap when the alignment is
-     * above a certain limit. */
-    ret = posix_memalign(&ptr, pagesize, limit);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to get aligned memory chunk: %d\n", ret);
-        return NULL;
+    if (settings.verbose > 0) {
+        fprintf(stderr, "Slab memory allocated using %s (%zu bytes)\n",
+                hugepage_type_name(slab_hugepage_alloc.type),
+                slab_hugepage_alloc.size);
     }
 
-    ret = madvise(ptr, limit, MADV_HUGEPAGE);
-    if (ret < 0) {
-        fprintf(stderr, "Failed to set transparent hugepage hint: %d\n", ret);
-        free(ptr);
-        ptr = NULL;
-    }
-#elif defined(__FreeBSD__)
-    size_t align = (sizeof(size_t) * 8 - (__builtin_clzl(4095)));
-    ptr = mmap(NULL, limit, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_ALIGNED(align) | MAP_ALIGNED_SUPER, -1, 0);
-    if (ptr == MAP_FAILED) {
-        fprintf(stderr, "Failed to set super pages\n");
-        ptr = NULL;
-    }
-#else
-    ptr = malloc(limit);
-#endif
     return ptr;
 }
 
@@ -210,6 +186,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             do_slab_prealloc = true;
             mem_current = mem_base;
             mem_avail = mem_limit;
+            dto_memset_pages(mem_base, (char *)mem_base + mem_limit, 2*1024*1024);
         } else {
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
                     " one large chunk.\nWill allocate in smaller chunks\n");

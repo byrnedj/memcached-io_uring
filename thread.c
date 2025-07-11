@@ -3,6 +3,7 @@
  * Thread management for memcached.
  */
 #include "memcached.h"
+#include "hugepage.h"
 #ifdef EXTSTORE
 #include "storage.h"
 #endif
@@ -17,7 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
+#include <linux/io_uring.h>
+#include <liburing.h>
 #include "queue.h"
 #include "tls.h"
 
@@ -103,8 +105,12 @@ static void notify_worker_fd(LIBEVENT_THREAD *t, int sfd, enum conn_queue_item_m
 static CQ_ITEM *cqi_new(CQ *cq);
 static void cq_push(CQ *cq, CQ_ITEM *item);
 
+static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me);
+void memcached_thread_io_uring_cleanup(LIBEVENT_THREAD *me);
+
 static void thread_libevent_process(evutil_socket_t fd, short which, void *arg);
 static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg);
+static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg);
 
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
@@ -261,6 +267,13 @@ void stop_threads(void) {
         pthread_join(threads[i].thread_id, NULL);
     }
 
+    // Clean up io_uring resources for each thread
+    if (settings.use_io_uring) {
+        for (i = 0; i < settings.num_threads; i++) {
+            memcached_thread_io_uring_cleanup(&threads[i]);
+        }
+    }
+
     if (settings.verbose > 0)
         fprintf(stderr, "all background threads stopped\n");
 
@@ -414,6 +427,22 @@ static void setup_thread_notify(LIBEVENT_THREAD *me, struct thread_notify *tn,
     }
 }
 
+static void setup_thread_io_uring_notify(LIBEVENT_THREAD *me,
+        void(*cb)(int, short, void *)) {
+
+    event_set(&me->io_uring_ev, me->io_uring_fd,
+              EV_READ | EV_PERSIST, cb, me);
+    event_base_set(me->base, &me->io_uring_ev);
+    event_add(&me->io_uring_ev, 0);
+    io_uring_register_eventfd(me->ring, me->io_uring_fd);
+    fprintf(stderr,
+        "[io_uring] thread %lu init: ring=%p eventfd=%d depth=%d\n",
+        (unsigned long)me->thread_id,
+        (void *)me->ring,
+        me->io_uring_fd,
+        settings.io_uring_depth);
+}
+
 /*
  * Set up a thread's information.
  */
@@ -423,6 +452,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     ev_config = event_config_new();
     event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
     me->base = event_base_new_with_config(ev_config);
+
     event_config_free(ev_config);
 #else
     me->base = event_init();
@@ -432,8 +462,9 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         fprintf(stderr, "Can't allocate event base\n");
         exit(1);
     }
-
-    /* Listen for notifications from other threads */
+    if (settings.use_io_uring) {
+        setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
+    }
     setup_thread_notify(me, &me->n, thread_libevent_process);
     setup_thread_notify(me, &me->ion, thread_libevent_ionotify);
     pthread_mutex_init(&me->ion_lock, NULL);
@@ -451,11 +482,15 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(EXIT_FAILURE);
     }
 
+
     me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *));
-    if (me->rbuf_cache == NULL) {
-        fprintf(stderr, "Failed to create read buffer cache\n");
+    me->io_uring_cache = cache_create("io_uring", sizeof(struct io_uring_op_ctx), sizeof(struct io_uring_op_ctx*));
+    if (me->rbuf_cache == NULL || me->io_uring_cache == NULL) {
+        fprintf(stderr, "Failed to create read buffer or io_uring op cache\n");
         exit(EXIT_FAILURE);
     }
+    cache_set_limit(me->rbuf_cache, 4096);
+    cache_set_limit(me->io_uring_cache, 4096);
     // Note: we were cleanly passing in num_threads before, but this now
     // relies on settings globals too much.
     if (settings.read_buf_mem_limit) {
@@ -469,6 +504,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     }
 
     me->io_cache = cache_create("io", sizeof(io_pending_t), sizeof(char*));
+    cache_set_limit(me->io_cache, 1024);
     if (me->io_cache == NULL) {
         fprintf(stderr, "Failed to create IO object cache\n");
         exit(EXIT_FAILURE);
@@ -522,7 +558,26 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
     while (!event_base_got_exit(me->base)) {
-        event_base_loop(me->base, EVLOOP_ONCE);
+        int ev_ret = event_base_loop(me->base,EVLOOP_ONCE);
+        if (ev_ret < 0) {
+            fprintf(stderr, "Event base loop returned error: %s\n",
+                    evutil_socket_error_to_string(ev_ret));
+            break;
+        }
+	if (settings.use_io_uring) {
+            int ready = io_uring_sq_ready(me->ring);
+            if (ready > 0) {
+                if (settings.verbose > 2) {
+                    fprintf(stderr, "[io_uring] thread %lu ev ready events: %d\n",
+                            (unsigned long)me->thread_id, ready);
+                }
+                int ret = io_uring_submit(me->ring);
+                if (ret < 0) {
+                    fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+                            (unsigned long)me->thread_id, strerror(-ret));
+                }
+            }
+	}
         // Run IO queues after the event loop to catch things like
         // re-submissions from proxy callbacks.
         thread_io_queue_submit(me);
@@ -581,6 +636,76 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
     }
 }
 
+
+/*
+ * Processes an incoming "connection event" item. This is called when
+ * input arrives on the libevent wakeup pipe.
+ */
+static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    uint64_t ev_count = 0; // max number of events to loop through this run.
+    // NOTE: unlike pipe we aren't limiting the number of events per read.
+    // However we do limit the number of queue pulls to what the count was at
+    // the time of this function firing.
+    if (read(fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        if (settings.verbose > 0)
+            fprintf(stderr, "Can't read from libevent pipe\n");
+        return;
+    }
+
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    int i = 0;
+    //while (1) {
+    //    int ret = io_uring_peek_cqe(me->ring, &cqe);
+    //    if (ret == -EINTR) {
+    //      continue;
+    //    }
+    //    if (ret == -EAGAIN || ret == -ETIME) {
+    //      ret = io_uring_wait_cqe_timeout(me->ring, &cqe, &ts);
+    //      if (ret == -ETIME || ret == -EINTR) {
+    //    	 continue;
+    //      }
+    // 
+    	io_uring_for_each_cqe(me->ring, head, cqe) {
+    	    struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+    	    if (settings.verbose > 2) {
+    	        char *type = "unknown";
+    	        switch (op->type) {
+    	            case OP_RECV:
+    	                type = "recv";
+    	                break;
+    	            default:
+    	                type = "unknown";
+    	                break;
+    	        }
+    	        fprintf(stderr, "[io_uring] fd %d thread %lu processing event type: %s res=%d flags=0x%x\n",
+    	                fd, (unsigned long)me->thread_id, type, cqe->res, cqe->flags);
+    	    }
+    	    op->handler(op, cqe->res, cqe->flags);
+    	    i++;
+    	}
+    	if (settings.verbose > 2) {
+    	    fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
+    	}
+    	io_uring_cq_advance(me->ring, i);
+    	int ready = io_uring_sq_ready(me->ring);
+    	if (ready > 0) {
+    	    if (settings.verbose > 2) {
+    	        fprintf(stderr, "[io_uring] thread %lu evcb ready events: %d, processed %d\n",
+    	                (unsigned long)me->thread_id, ready, i);
+    	    }
+    	    int ret = io_uring_submit(me->ring);
+    	    if (ret < 0) {
+    	        fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+    	                (unsigned long)me->thread_id, strerror(-ret));
+    	    }
+    	}
+    //}
+
+
+}
+
 /*
  * Processes an incoming "connection event" item. This is called when
  * input arrives on the libevent wakeup pipe.
@@ -620,7 +745,8 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
             case queue_new_conn:
                 c = conn_new(item->sfd, item->init_state, item->event_flags,
                                    item->read_buffer_size, item->transport,
-                                   me->base, item->ssl, item->conntag, item->bproto);
+                                   me->base, item->ssl, item->conntag, item->bproto,
+                                   settings.use_io_uring);
                 if (c == NULL) {
                     if (IS_UDP(item->transport)) {
                         fprintf(stderr, "Can't listen for events on UDP socket\n");
@@ -638,6 +764,82 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
                 } else {
                     c->thread = me;
+
+                    //at this point, the connection is fully initialized
+                    if (settings.use_io_uring) {
+                        assert(c->state == conn_new_cmd);
+                        //here we can prep recv the data
+                        drive_machine(c);
+
+            		int ready = io_uring_sq_ready(me->ring);
+            		if (ready > 0) {
+            		    if (settings.verbose > 2) {
+            		        fprintf(stderr, "[io_uring] thread %lu first ready events: %d\n",
+            		                (unsigned long)me->thread_id, ready);
+            		    }
+            		    int ret = io_uring_submit(me->ring);
+            		    if (ret < 0) {
+            		        fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+            		                (unsigned long)me->thread_id, strerror(-ret));
+            		    }
+                        }
+                       // 
+		       //     
+    		       //     struct io_uring_cqe *cqe;
+    		       //     unsigned head;
+    		       // struct __kernel_timespec ts = {0};
+    		       //     int i = 0;
+		       //     while (1) {
+		       // 	int ret = io_uring_peek_cqe(me->ring, &cqe);
+		       // 	if (ret == -EINTR) {
+		       // 	  continue;
+		       // 	}
+		       // 	if (ret == -EAGAIN || ret == -ETIME) {
+		       // 	  ret = io_uring_wait_cqe_timeout(me->ring, &cqe, &ts);
+		       // 	  if (ret == -ETIME || ret == -EINTR) {
+		       // 		 continue;
+		       // 	  }
+		       // 	}
+    		       //     io_uring_for_each_cqe(me->ring, head, cqe) {
+    		       //         struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+    		       //         if (settings.verbose > 2) {
+    		       //             char *type = "unknown";
+    		       //             switch (op->type) {
+    		       //                 case OP_RECV:
+    		       //                     type = "recv";
+    		       //                     break;
+    		       //                 default:
+    		       //                     type = "unknown";
+    		       //                     break;
+    		       //             }
+    		       //             fprintf(stderr, "[io_uring] thread %lu processing event type: %s res=%d\n",
+    		       //                     (unsigned long)me->thread_id, type, cqe->res);
+    		       //         }
+    		       //         op->handler(op, cqe->res);
+    		       //         i++;
+    		       //     if (settings.verbose > 2) {
+    		       //         fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
+    		       //     }
+    		       //     io_uring_cq_advance(me->ring, i);
+    		       //     int ready = io_uring_sq_ready(me->ring);
+    		       //     if (ready > 0) {
+    		       //         if (settings.verbose > 2) {
+    		       //             fprintf(stderr, "[io_uring] thread %lu ready events: %d, processed %d\n",
+    		       //                     (unsigned long)me->thread_id, ready, i);
+    		       //         }
+    		       //         int ret = io_uring_submit(me->ring);
+    		       //         if (ret < 0) {
+    		       //             fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+    		       //                     (unsigned long)me->thread_id, strerror(-ret));
+    		       //         }
+    		       //     }
+		       //     }
+		       //     }
+		       // }
+                       // //queue_recv(c, NULL, 0);
+
+                       // //setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
+                    }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
                         assert(c->thread && c->thread->ssl_wbuf);
@@ -1074,6 +1276,172 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 #endif
 }
 
+// Get the pointer to a provided buffer by its ID
+char *io_uring_buf_get_ptr(LIBEVENT_THREAD *t, int buf_id) {
+    if (buf_id < 0 || buf_id >= t->io_uring_buf_count) {
+        return NULL;
+    }
+    return t->io_uring_buf_mem + (buf_id * IO_URING_REGISTERED_BUFFER_SIZE);
+}
+
+// Recycle a buffer back to the provided buffer ring
+void io_uring_buf_recycle(LIBEVENT_THREAD *t, int buf_id) {
+    if (buf_id < 0 || buf_id >= t->io_uring_buf_count || !t->buf_ring) {
+        return;
+    }
+
+    char *buf_ptr = io_uring_buf_get_ptr(t, buf_id);
+    if (!buf_ptr) {
+        return;
+    }
+
+    // Calculate ring mask (ring size is power of 2)
+    int ring_entries = t->io_uring_buf_count;
+    ring_entries--;
+    ring_entries |= ring_entries >> 1;
+    ring_entries |= ring_entries >> 2;
+    ring_entries |= ring_entries >> 4;
+    ring_entries |= ring_entries >> 8;
+    ring_entries |= ring_entries >> 16;
+    ring_entries++;
+
+    // Add buffer back to the ring and make it visible
+    unsigned short old_tail = t->buf_ring->tail;
+    int mask = io_uring_buf_ring_mask(ring_entries);
+    io_uring_buf_ring_add(t->buf_ring, buf_ptr, IO_URING_REGISTERED_BUFFER_SIZE,
+                          buf_id, mask, 0);
+    io_uring_buf_ring_advance(t->buf_ring, 1);
+    t->buf_recycled++;
+
+    unsigned short new_tail = t->buf_ring->tail;
+    if (new_tail != (unsigned short)(old_tail + 1)) {
+        fprintf(stderr, "ERROR: tail did not increment! old=%u new=%u expected=%u\n",
+                old_tail, new_tail, (unsigned short)(old_tail + 1));
+    }
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "Recycled buf %d at pos %d, tail %u->%u (sel=%lu rec=%lu inflight=%ld)\n",
+                buf_id, (old_tail & mask), old_tail, new_tail,
+                t->buf_selected, t->buf_recycled,
+                (long)(t->buf_selected - t->buf_recycled));
+    }
+}
+
+// Cleanup io_uring provided buffers for a thread
+void memcached_thread_io_uring_cleanup(LIBEVENT_THREAD *me) {
+    if (settings.use_io_uring_registered_buffers && me->buf_ring) {
+        // Free the buffer ring
+        if (me->ring) {
+            io_uring_free_buf_ring(me->ring, me->buf_ring, me->io_uring_buf_count, me->io_uring_bgid);
+            me->buf_ring = NULL;
+        }
+
+        // Free buffer memory
+        if (me->io_uring_buf_mem) {
+            free(me->io_uring_buf_mem);
+            me->io_uring_buf_mem = NULL;
+        }
+
+        if (settings.verbose > 0) {
+            fprintf(stderr, "Thread %lu: Cleaned up io_uring provided buffers\n",
+                    (unsigned long)me->thread_id);
+        }
+    }
+
+    // Clean up io_uring ring
+    if (me->ring) {
+        io_uring_queue_exit(me->ring);
+        free(me->ring);
+        me->ring = NULL;
+    }
+}
+
+static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
+    int ret;
+    me->ring = malloc(sizeof(struct io_uring));
+    ret = io_uring_queue_init(settings.io_uring_depth, me->ring, 0); //todo add IO_URING_SETUP_SQPOLL if we want to use that.
+    if (ret < 0) {
+        fprintf(stderr, "Failed to initialize io_uring: %s\n", strerror(-ret));
+        exit(EXIT_FAILURE);
+    }
+    me->io_uring_fd = eventfd(0, EFD_NONBLOCK);
+
+    // Initialize provided buffer ring support
+    if (settings.use_io_uring_registered_buffers) {
+        me->io_uring_buf_count = settings.io_uring_buf_count;
+        me->io_uring_bgid = me->thread_baseid;  // Use thread ID as buffer group ID
+        me->buf_selected = 0;
+        me->buf_recycled = 0;
+
+        // Allocate backing memory for all buffers (page-aligned for better performance)
+        size_t buf_size = IO_URING_REGISTERED_BUFFER_SIZE;
+        size_t total_mem = me->io_uring_buf_count * buf_size;
+
+        /* Try huge pages for large io_uring buffer allocations */
+        if (settings.use_hugepages && total_mem >= HUGEPAGE_SIZE_2MB) {
+            unsigned int flags = HUGEPAGE_FLAG_PREFAULT |
+                                 HUGEPAGE_FLAG_MLOCK |
+                                 HUGEPAGE_FLAG_THP_FALLBACK |
+                                 HUGEPAGE_FLAG_MALLOC_FALLBACK;
+            me->io_uring_buf_mem = hugepage_alloc(total_mem, flags, NULL);
+            if (me->io_uring_buf_mem != NULL && settings.verbose > 0) {
+                fprintf(stderr, "Thread %d: io_uring buffers allocated with huge pages (%zu bytes)\n",
+                        me->thread_baseid, total_mem);
+            }
+        }
+
+        /* Fall back to posix_memalign */
+        if (me->io_uring_buf_mem == NULL) {
+            ret = posix_memalign((void **)&me->io_uring_buf_mem, 4096, total_mem);
+            if (ret != 0) {
+                me->io_uring_buf_mem = NULL;
+            }
+        }
+
+        if (!me->io_uring_buf_mem) {
+            fprintf(stderr, "Failed to allocate io_uring buffer memory (%zu bytes)\n", total_mem);
+            exit(EXIT_FAILURE);
+        }
+
+        // Setup the provided buffer ring
+        // The ring size must be a power of 2 and at least as large as the number of buffers
+        int ring_entries = me->io_uring_buf_count;
+        // Round up to next power of 2
+        ring_entries--;
+        ring_entries |= ring_entries >> 1;
+        ring_entries |= ring_entries >> 2;
+        ring_entries |= ring_entries >> 4;
+        ring_entries |= ring_entries >> 8;
+        ring_entries |= ring_entries >> 16;
+        ring_entries++;
+        if (ring_entries < me->io_uring_buf_count) {
+            ring_entries = me->io_uring_buf_count;
+        }
+
+        me->buf_ring = io_uring_setup_buf_ring(me->ring, ring_entries, me->io_uring_bgid, 0, &ret);
+        if (!me->buf_ring) {
+            fprintf(stderr, "Failed to setup io_uring buffer ring: %s\n", strerror(-ret));
+            exit(EXIT_FAILURE);
+        }
+
+        // Add all buffers to the ring
+        for (int i = 0; i < me->io_uring_buf_count; i++) {
+            char *buf_ptr = me->io_uring_buf_mem + (i * buf_size);
+            io_uring_buf_ring_add(me->buf_ring, buf_ptr, buf_size, i,
+                                  io_uring_buf_ring_mask(ring_entries), i);
+        }
+        // Make all buffers visible to the kernel
+        io_uring_buf_ring_advance(me->buf_ring, me->io_uring_buf_count);
+
+        if (settings.verbose > 0) {
+            fprintf(stderr, "Thread %lu: Setup provided buffer ring with %d buffers (%zu bytes each), bgid=%d, tail=%u, mask=%d\n",
+                    (unsigned long)me->thread_id, me->io_uring_buf_count,
+                    (size_t)IO_URING_REGISTERED_BUFFER_SIZE, me->io_uring_bgid,
+                    me->buf_ring->tail, io_uring_buf_ring_mask(ring_entries));
+        }
+    }
+}
+
 /*
  * Initializes the thread subsystem, creating various worker threads.
  *
@@ -1135,6 +1503,9 @@ void memcached_thread_init(int nthreads, void *arg) {
     for (i = 0; i < nthreads; i++) {
         memcached_thread_notify_init(&threads[i].n);
         memcached_thread_notify_init(&threads[i].ion);
+        if (settings.use_io_uring) {
+            memcached_thread_io_uring_init(&threads[i]);
+        }
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
@@ -1142,6 +1513,9 @@ void memcached_thread_init(int nthreads, void *arg) {
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
+        if (settings.use_io_uring) {
+            stats_state.reserved_fds += 1; // io_uring eventfd
+        }
     }
 
     /* Create threads after we've done all the libevent setup. */

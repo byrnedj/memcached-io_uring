@@ -88,10 +88,18 @@ int try_read_command_binary(conn *c) {
         if (c->rbytes < keylen + extlen + sizeof(c->binary_header)) {
             // Still need more bytes. Let try_read_network() realign the
             // read-buffer and fetch more data as necessary.
+            if (settings.verbose > 1) {
+                fprintf(stderr, "<%d need more bytes: have %d, need %zu (hdr=%zu key=%u ext=%u)\n",
+                        c->sfd, c->rbytes, keylen + extlen + sizeof(c->binary_header),
+                        sizeof(c->binary_header), keylen, extlen);
+            }
             return 0;
         }
 
         if (!resp_start(c)) {
+            if (settings.verbose) {
+                fprintf(stderr, "<%d resp_start failed (OOM), closing connection\n", c->sfd);
+            }
             conn_set_state(c, conn_closing);
             return -1;
         }
@@ -762,6 +770,9 @@ static void process_bin_sasl_auth(conn *c) {
     c->ritem = ITEM_data(it);
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_reading_sasl_auth_data;
 }
 
@@ -1183,6 +1194,9 @@ static void process_bin_update(conn *c, char *extbuf) {
 #endif
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_read_set_value;
 }
 
@@ -1246,6 +1260,9 @@ static void process_bin_append_prepend(conn *c) {
 #endif
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_read_set_value;
 }
 

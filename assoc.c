@@ -12,6 +12,7 @@
  */
 
 #include "memcached.h"
+#include "hugepage.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -43,6 +44,10 @@ static item** primary_hashtable = 0;
  */
 static item** old_hashtable = 0;
 
+/* Huge page allocation metadata for hash tables */
+static hugepage_alloc_t primary_hashtable_alloc;
+static hugepage_alloc_t old_hashtable_alloc;
+
 /* Flag: Are we in the middle of expanding now? */
 static bool expanding = false;
 
@@ -56,7 +61,31 @@ void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+
+    size_t table_size = hashsize(hashpower) * sizeof(void *);
+
+    /* Try huge pages for large hash tables */
+    if (settings.use_hugepages && table_size >= HUGEPAGE_SIZE_2MB) {
+        unsigned int flags = HUGEPAGE_FLAG_PREFAULT |
+                             HUGEPAGE_FLAG_THP_FALLBACK |
+                             HUGEPAGE_FLAG_MALLOC_FALLBACK;
+        primary_hashtable = hugepage_alloc(table_size, flags, &primary_hashtable_alloc);
+        if (primary_hashtable != NULL) {
+            /* Zero the memory since hugepage_alloc doesn't guarantee zeroed memory */
+            memset(primary_hashtable, 0, table_size);
+            if (settings.verbose > 0) {
+                fprintf(stderr, "Hash table allocated using %s (%zu bytes)\n",
+                        hugepage_type_name(primary_hashtable_alloc.type), table_size);
+            }
+        }
+    }
+
+    /* Fall back to calloc if huge pages weren't used or failed */
+    if (primary_hashtable == NULL) {
+        primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+        primary_hashtable_alloc.ptr = NULL;  /* Mark as not using hugepages */
+    }
+
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
@@ -121,8 +150,33 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
 /* grows the hashtable to the next power of 2. */
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
+    old_hashtable_alloc = primary_hashtable_alloc;
 
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    size_t table_size = hashsize(hashpower + 1) * sizeof(void *);
+    primary_hashtable = NULL;
+    primary_hashtable_alloc.ptr = NULL;
+
+    /* Try huge pages for large hash tables */
+    if (settings.use_hugepages && table_size >= HUGEPAGE_SIZE_2MB) {
+        unsigned int flags = HUGEPAGE_FLAG_PREFAULT |
+                             HUGEPAGE_FLAG_THP_FALLBACK |
+                             HUGEPAGE_FLAG_MALLOC_FALLBACK;
+        primary_hashtable = hugepage_alloc(table_size, flags, &primary_hashtable_alloc);
+        if (primary_hashtable != NULL) {
+            memset(primary_hashtable, 0, table_size);
+            if (settings.verbose > 1) {
+                fprintf(stderr, "Hash table expansion using %s (%zu bytes)\n",
+                        hugepage_type_name(primary_hashtable_alloc.type), table_size);
+            }
+        }
+    }
+
+    /* Fall back to calloc */
+    if (primary_hashtable == NULL) {
+        primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+        primary_hashtable_alloc.ptr = NULL;
+    }
+
     if (primary_hashtable) {
         if (settings.verbose > 1)
             fprintf(stderr, "Hash table expansion starting\n");
@@ -136,6 +190,7 @@ static void assoc_expand(void) {
         STATS_UNLOCK();
     } else {
         primary_hashtable = old_hashtable;
+        primary_hashtable_alloc = old_hashtable_alloc;
         /* Bad news, but we can keep running. */
     }
 }
@@ -223,7 +278,13 @@ static void *assoc_maintenance_thread(void *arg) {
                     expand_bucket++;
                     if (expand_bucket == hashsize(hashpower - 1)) {
                         expanding = false;
-                        free(old_hashtable);
+                        /* Free old hash table using appropriate method */
+                        if (old_hashtable_alloc.ptr != NULL) {
+                            hugepage_free(&old_hashtable_alloc);
+                        } else {
+                            free(old_hashtable);
+                        }
+                        old_hashtable = NULL;
                         STATS_LOCK();
                         stats_state.hash_bytes -= hashsize(hashpower - 1) * sizeof(void *);
                         stats_state.hash_is_expanding = false;
