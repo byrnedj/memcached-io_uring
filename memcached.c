@@ -133,7 +133,7 @@ enum transmit_result {
 /* Default methods to read from/ write to a socket */
 ssize_t tcp_read(conn *c, void *buf, size_t count) {
     assert (c != NULL);
-    return read(c->sfd, buf, count);
+    return recv(c->sfd, buf, count, MSG_WAITALL);
 }
 
 ssize_t tcp_sendmsg(conn *c, struct msghdr *msg, int flags) {
@@ -787,7 +787,16 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     stats_state.curr_conns++;
     stats.total_conns++;
     STATS_UNLOCK();
-
+    int rcvbuf = 1024*1024;
+    //struct timeval tv;
+    //tv.tv_sec  = 5;        // 5 seconds
+    //tv.tv_usec = 0;
+    //setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int res = setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)); 
+    if (res < 0) {
+        fprintf(stderr, "setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+    }
+    c->tbuf = malloc(4*1024*1024);
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
     return c;
@@ -3288,7 +3297,8 @@ static void drive_machine(conn *c) {
                 }
 
                 /*  now try reading from the socket */
-                res = c->read(c, c->ritem, c->rlbytes);
+                res = c->read(c, c->tbuf, c->rlbytes);
+                printf("tried %d but read %d bytes into tbuf\n", c->rlbytes, res);
                 if (res > 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
                     c->thread->stats.bytes_read += res;
@@ -3296,6 +3306,7 @@ static void drive_machine(conn *c) {
                     if (c->rcurr == c->ritem) {
                         c->rcurr += res;
                     }
+                    memcpy(c->ritem, c->tbuf, res);
                     c->ritem += res;
                     c->rlbytes -= res;
                     break;
