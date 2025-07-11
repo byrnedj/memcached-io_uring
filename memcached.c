@@ -27,6 +27,8 @@
 #include <sys/uio.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <linux/io_uring.h>
+#include <liburing.h>
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -65,6 +67,8 @@
  * forward declarations
  */
 static void drive_machine(conn *c);
+static void queue_recv(conn *c);
+static void queue_recv_exact(conn *c, size_t len);
 static int new_socket(struct addrinfo *ai);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
 static ssize_t tcp_sendmsg(conn *arg, struct msghdr *msg, int flags);
@@ -214,6 +218,8 @@ void stats_reset(void) {
 }
 
 static void settings_init(void) {
+    settings.use_io_uring = false;
+    settings.io_uring_depth = 1024; /* default io_uring depth */
     settings.use_cas = true;
     settings.access = 0700;
     settings.port = 11211;
@@ -2953,6 +2959,121 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
+
+
+/* Return true if we advanced the state-machine (parsed ≥ 1 command).      */
+/* Return false if we stopped because we need more bytes or hit an error. */
+static bool try_parse_some(conn *c)
+{
+    bool progress = false;
+
+    /* loop until the parser says “stop, I need more”                */
+    while (c->state == conn_parse_cmd) {
+        int rc = c->try_read_command(c);
+
+        if (rc > 0) {                   /* at least one full command parsed */
+            progress = true;
+            /* try_read_command() moved us to conn_new_cmd or conn_closing
+               as appropriate.  Re-enter drive_machine() later.           */
+            break;
+        } else if (rc == 0) {           /* header incomplete: need more     */
+            break;
+        } else {                        /* rc < 0 ⇒ protocol / OOM error    */
+            conn_set_state(c, conn_closing);
+            break;
+        }
+    }
+    return progress;
+}
+
+/* Submit the next RECV SQE exactly once.  Assumes no other RECV is armed. */
+static void queue_next_if_needed(conn *c)
+{
+    /* 1.  Are we in the middle of reading the value section of a SET/ADD?  */
+    if (c->state == conn_nread && c->rlbytes > 0) {
+        /* Need exactly rlbytes more to finish the item body.               */
+        queue_recv_exact(c, c->rlbytes);   /* → IORING_OP_RECV w/ len=rlbytes */
+        return;
+    }
+
+    /* 2.  Waiting for the next command header (conn_waiting).              */
+    if (c->state == conn_waiting || c->state == conn_parse_cmd) {
+        queue_recv(c);                     /* generic RECV (up to rsize)     */
+        return;
+    }
+
+    /* 3.  Nothing to do – either closing or we just queued a SEND.         */
+}
+
+
+static void recv_complete(struct io_uring_op_ctx *op, int res)
+{
+    conn *c = op->c;
+    free(op);
+
+    if (res > 0) {
+        c->rbytes += res;            /* bytes now in rbuf                */
+
+        /* 1.  If we were reading the value body, update rlbytes. */
+        if (c->state == conn_nread) {
+            c->rlbytes -= res;
+            if (c->rlbytes == 0)
+                complete_nread(c);   /* same function as before */
+        }
+
+        /* 2.  Try to parse whatever is available. */
+        try_parse_some(c);
+
+        /* 3.  Arm the next recv if needed. */
+        queue_next_if_needed(c);
+
+        /* 4.  Re-enter the state-machine for any synchronous work. */
+        drive_machine(c);
+
+    } else if (res == 0) {           /* peer closed cleanly */
+        c->close_reason = NORMAL_CLOSE;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+    } else {                         /* res < 0  ⇒  -errno   */
+        errno = -res;
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+    }
+}
+
+
+static void queue_recv(conn *c)
+{
+    //todo make this a thread local allocator like rbuf_cache
+    struct io_uring_op_ctx *op = malloc(sizeof(struct io_uring_op_ctx));
+    op->c       = c;
+    op->type    = OP_RECV;
+    op->handler = recv_complete;
+
+    struct io_uring_sqe *sqe =
+        io_uring_get_sqe(c->thread->ring);  /* ring is per worker */
+
+    io_uring_prep_recv(sqe, c->sfd, 
+                      c->rcurr, c->rsize - c->rbytes,
+                       0);
+    io_uring_sqe_set_data(sqe, op);          /* attaches context  */
+}
+
+static void queue_recv_exact(conn *c, size_t len)
+{
+    struct io_uring_op_ctx *op = malloc(sizeof(struct io_uring_op_ctx));
+    op->c       = c;
+    op->type    = OP_RECV;
+    op->handler = recv_complete;
+
+    struct io_uring_sqe *sqe =
+        io_uring_get_sqe(c->thread->ring);
+
+    io_uring_prep_recv(sqe, c->sfd, c->ritem, len, MSG_WAITALL);
+    io_uring_sqe_set_data(sqe, op);
+}
+
+
 static void drive_machine(conn *c) {
     bool stop = false;
     int sfd;
@@ -3045,13 +3166,18 @@ static void drive_machine(conn *c) {
 
         case conn_waiting:
             rbuf_release(c);
-            if (!update_event(c, EV_READ | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
-                conn_set_state(c, conn_closing);
-                break;
+            if (settings.use_io_uring) {
+                // If we use io_uring, we can queue a recv operation.
+                queue_recv(c);
+            } else {
+                // Otherwise, we need to update the event to read.
+                if (!update_event(c, EV_READ | EV_PERSIST)) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
             }
-
             conn_set_state(c, conn_read);
             stop = true;
             break;
@@ -4893,6 +5019,8 @@ int main (int argc, char **argv) {
           "b:"  /* backlog queue limit */
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
+          "O"   /* Enable io_uring */
+          "Q:"   /* io_uring_q_depth */
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
@@ -5018,6 +5146,12 @@ int main (int argc, char **argv) {
             exit(EXIT_SUCCESS);
         case 'k':
             lock_memory = true;
+            break;
+        case 'O':
+            settings.use_io_uring = true;
+            break;
+        case 'Q':
+            settings.io_uring_depth = atoi(optarg);
             break;
         case 'v':
             settings.verbose++;

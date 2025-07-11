@@ -17,7 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
+#include <linux/io_uring.h>
+#include <liburing.h>
 #include "queue.h"
 #include "tls.h"
 
@@ -105,6 +106,7 @@ static void cq_push(CQ *cq, CQ_ITEM *item);
 
 static void thread_libevent_process(evutil_socket_t fd, short which, void *arg);
 static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg);
+static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg);
 
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
@@ -414,6 +416,14 @@ static void setup_thread_notify(LIBEVENT_THREAD *me, struct thread_notify *tn,
     }
 }
 
+static void setup_thread_io_uring_notify(LIBEVENT_THREAD *me,
+        void(*cb)(int, short, void *)) {
+    event_set(&me->io_uring_ev, me->io_uring_fd,
+              EV_READ | EV_PERSIST, cb, me);
+    event_base_set(me->base, &me->io_uring_ev);
+    event_add(&me->io_uring_ev, 0);
+}
+
 /*
  * Set up a thread's information.
  */
@@ -434,7 +444,11 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     }
 
     /* Listen for notifications from other threads */
-    setup_thread_notify(me, &me->n, thread_libevent_process);
+    if (settings.use_io_uring) {
+    	setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
+    } else {
+    	setup_thread_notify(me, &me->n, thread_libevent_process);
+    }
     setup_thread_notify(me, &me->ion, thread_libevent_ionotify);
     pthread_mutex_init(&me->ion_lock, NULL);
     STAILQ_INIT(&me->ion_head);
@@ -450,6 +464,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         perror("Failed to initialize mutex");
         exit(EXIT_FAILURE);
     }
+
 
     me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *));
     if (me->rbuf_cache == NULL) {
@@ -579,6 +594,32 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
         STAILQ_REMOVE_HEAD(&head, iop_next);
         conn_io_queue_return(io);
     }
+}
+
+
+/*
+ * Processes an incoming "connection event" item. This is called when
+ * input arrives on the libevent wakeup pipe.
+ */
+static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    uint64_t ev_count = 0; // max number of events to loop through this run.
+    // NOTE: unlike pipe we aren't limiting the number of events per read.
+    // However we do limit the number of queue pulls to what the count was at
+    // the time of this function firing.
+    if (read(fd, &ev_count, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        if (settings.verbose > 0)
+            fprintf(stderr, "Can't read from libevent pipe\n");
+        return;
+    }
+
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    io_uring_for_each_cqe(me->ring, head, cqe) {
+        struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+        op->handler(op, cqe->res);
+    }
+    io_uring_cq_advance(me->ring, io_uring_cq_ready(me->ring));
 }
 
 /*
@@ -1074,6 +1115,19 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 #endif
 }
 
+static void memcached_thread_io_uring_init(struct io_uring *ring, int *io_uring_fd) {
+    int ret;
+    ring = malloc(sizeof(struct io_uring));
+    ret = io_uring_queue_init(settings.io_uring_depth, ring, IORING_SETUP_SQPOLL);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to initialize io_uring: %s\n", strerror(-ret));
+        exit(EXIT_FAILURE);
+    }
+
+    *io_uring_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    io_uring_register_eventfd(ring, *io_uring_fd);
+}
+
 /*
  * Initializes the thread subsystem, creating various worker threads.
  *
@@ -1135,6 +1189,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     for (i = 0; i < nthreads; i++) {
         memcached_thread_notify_init(&threads[i].n);
         memcached_thread_notify_init(&threads[i].ion);
+        memcached_thread_io_uring_init(threads[i].ring, &threads[i].io_uring_fd);
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
