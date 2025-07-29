@@ -104,6 +104,8 @@ static void notify_worker_fd(LIBEVENT_THREAD *t, int sfd, enum conn_queue_item_m
 static CQ_ITEM *cqi_new(CQ *cq);
 static void cq_push(CQ *cq, CQ_ITEM *item);
 
+static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me);
+
 static void thread_libevent_process(evutil_socket_t fd, short which, void *arg);
 static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg);
 static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg);
@@ -418,10 +420,18 @@ static void setup_thread_notify(LIBEVENT_THREAD *me, struct thread_notify *tn,
 
 static void setup_thread_io_uring_notify(LIBEVENT_THREAD *me,
         void(*cb)(int, short, void *)) {
+
     event_set(&me->io_uring_ev, me->io_uring_fd,
               EV_READ | EV_PERSIST, cb, me);
     event_base_set(me->base, &me->io_uring_ev);
     event_add(&me->io_uring_ev, 0);
+    io_uring_register_eventfd(me->ring, me->io_uring_fd);
+    fprintf(stderr,
+        "[io_uring] thread %lu init: ring=%p eventfd=%d depth=%d\n",
+        (unsigned long)pthread_self(),
+        me->ring,
+        me->io_uring_fd,
+        settings.io_uring_depth);
 }
 
 /*
@@ -433,6 +443,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     ev_config = event_config_new();
     event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
     me->base = event_base_new_with_config(ev_config);
+
     event_config_free(ev_config);
 #else
     me->base = event_init();
@@ -442,13 +453,10 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         fprintf(stderr, "Can't allocate event base\n");
         exit(1);
     }
-
-    /* Listen for notifications from other threads */
     if (settings.use_io_uring) {
-    	setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
-    } else {
-    	setup_thread_notify(me, &me->n, thread_libevent_process);
+        setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
     }
+    setup_thread_notify(me, &me->n, thread_libevent_process);
     setup_thread_notify(me, &me->ion, thread_libevent_ionotify);
     pthread_mutex_init(&me->ion_lock, NULL);
     STAILQ_INIT(&me->ion_head);
@@ -467,8 +475,9 @@ static void setup_thread(LIBEVENT_THREAD *me) {
 
 
     me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *));
-    if (me->rbuf_cache == NULL) {
-        fprintf(stderr, "Failed to create read buffer cache\n");
+    me->io_uring_cache = cache_create("io_uring", sizeof(struct io_uring_op_ctx) * 1000, sizeof(struct io_uring_op_ctx));
+    if (me->rbuf_cache == NULL || me->io_uring_cache == NULL) {
+        fprintf(stderr, "Failed to create read buffer or io_uring op cache\n");
         exit(EXIT_FAILURE);
     }
     // Note: we were cleanly passing in num_threads before, but this now
@@ -537,7 +546,19 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
     while (!event_base_got_exit(me->base)) {
+        //event_base_dump_events(me->base, stderr);
         event_base_loop(me->base, EVLOOP_ONCE);
+        //struct io_uring_cqe *cqe;
+        //unsigned int head;
+        //int i = 0;
+        //io_uring_for_each_cqe(me->ring, head, cqe) {
+        //    struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+        //    op->handler(op, cqe->res);
+        //    i++;
+        //}
+        //if (settings.verbose > 2) {
+        //    fprintf(stderr, "Worker %d processed %d IO events\n", me->thread_id, i);
+        //}
         // Run IO queues after the event loop to catch things like
         // re-submissions from proxy callbacks.
         thread_io_queue_submit(me);
@@ -661,7 +682,8 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
             case queue_new_conn:
                 c = conn_new(item->sfd, item->init_state, item->event_flags,
                                    item->read_buffer_size, item->transport,
-                                   me->base, item->ssl, item->conntag, item->bproto);
+                                   me->base, item->ssl, item->conntag, item->bproto,
+                                   settings.use_io_uring);
                 if (c == NULL) {
                     if (IS_UDP(item->transport)) {
                         fprintf(stderr, "Can't listen for events on UDP socket\n");
@@ -679,6 +701,16 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
                 } else {
                     c->thread = me;
+
+                    //at this point, the connection is fully initialized
+                    if (settings.use_io_uring) {
+                        assert(c->state == conn_new_cmd);
+                        queue_recv(c, NULL, 0);
+                        //here we can prep recv the data
+                        //drive_machine(c);
+
+                        //setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
+                    }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
                         assert(c->thread && c->thread->ssl_wbuf);
@@ -1115,17 +1147,15 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 #endif
 }
 
-static void memcached_thread_io_uring_init(struct io_uring *ring, int *io_uring_fd) {
+static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
     int ret;
-    ring = malloc(sizeof(struct io_uring));
-    ret = io_uring_queue_init(settings.io_uring_depth, ring, IORING_SETUP_SQPOLL);
+    me->ring = malloc(sizeof(struct io_uring));
+    ret = io_uring_queue_init(settings.io_uring_depth, me->ring, 0); //todo add IO_URING_SETUP_SQPOLL if we want to use that.
     if (ret < 0) {
         fprintf(stderr, "Failed to initialize io_uring: %s\n", strerror(-ret));
         exit(EXIT_FAILURE);
     }
-
-    *io_uring_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    io_uring_register_eventfd(ring, *io_uring_fd);
+    me->io_uring_fd = eventfd(0, EFD_NONBLOCK);
 }
 
 /*
@@ -1189,7 +1219,9 @@ void memcached_thread_init(int nthreads, void *arg) {
     for (i = 0; i < nthreads; i++) {
         memcached_thread_notify_init(&threads[i].n);
         memcached_thread_notify_init(&threads[i].ion);
-        memcached_thread_io_uring_init(threads[i].ring, &threads[i].io_uring_fd);
+        if (settings.use_io_uring) {
+            memcached_thread_io_uring_init(&threads[i]);
+        }
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
@@ -1197,6 +1229,9 @@ void memcached_thread_init(int nthreads, void *arg) {
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
+        if (settings.use_io_uring) {
+            stats_state.reserved_fds += 1; // io_uring eventfd
+        }
     }
 
     /* Create threads after we've done all the libevent setup. */

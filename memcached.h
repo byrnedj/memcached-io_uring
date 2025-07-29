@@ -734,6 +734,7 @@ typedef struct {
     io_queue_t io_queues[IO_QUEUE_COUNT];
     struct conn_queue *ev_queue; /* Worker/conn event queue */
     cache_t *rbuf_cache;        /* static-sized read buffers */
+    cache_t *io_uring_cache;        /* static-sized read buffers */
     mc_resp_bundle *open_bundle;
     cache_t *io_cache;          /* IO objects */
     struct io_uring *ring;      /* io_uring ring for this thread */
@@ -976,7 +977,10 @@ void conn_io_queue_return(io_pending_t *io);
     } while (0)
 
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
-    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto);
+    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto,
+    bool use_io_uring);
+void drive_machine(conn *c);
+void queue_recv(conn *c, void *buf, size_t len);
 
 void conn_worker_readd(conn *c);
 extern int daemonize(int nochdir, int noclose);

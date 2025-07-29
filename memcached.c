@@ -66,8 +66,6 @@
 /*
  * forward declarations
  */
-static void drive_machine(conn *c);
-static void queue_recv(conn *c);
 static void queue_recv_exact(conn *c, size_t len);
 static int new_socket(struct addrinfo *ai);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
@@ -409,6 +407,20 @@ static void rbuf_release(conn *c) {
     }
 }
 
+static bool io_uring_alloc(conn *c, struct io_uring_op_ctx *op) {
+    if (!op) {
+        THR_STATS_LOCK(c->thread);
+        c->thread->stats.read_buf_oom++;
+        THR_STATS_UNLOCK(c->thread);
+        return false;
+    }
+    return true;
+}
+
+static void io_uring_release(conn *c, struct io_uring_op_ctx *op) {
+    do_cache_free(c->thread->io_uring_cache, op);
+}
+
 static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
         c->rbuf = do_cache_alloc(c->thread->rbuf_cache);
@@ -615,7 +627,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base, void *ssl, uint64_t conntag,
-                enum protocol bproto) {
+                enum protocol bproto, bool use_io_uring) {
     conn *c;
 
     assert(sfd >= 0 && sfd < max_fds);
@@ -774,14 +786,16 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
-
-    if (event_add(&c->event, 0) == -1) {
-        perror("event_add");
-        return NULL;
+    if (!use_io_uring) {
+        event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+        event_base_set(base, &c->event);
+        c->ev_flags = event_flags;
+        if (event_add(&c->event, 0) == -1) {
+            perror("event_add");
+            return NULL;
+        }
     }
+
 
     STATS_LOCK();
     stats_state.curr_conns++;
@@ -792,11 +806,11 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     //tv.tv_sec  = 5;        // 5 seconds
     //tv.tv_usec = 0;
     //setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    int res = setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)); 
-    if (res < 0) {
-        fprintf(stderr, "setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
-    }
-    c->tbuf = malloc(4*1024*1024);
+    //int res = setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)); 
+    //if (res < 0) {
+    //    fprintf(stderr, "setsockopt(SO_RCVBUF) failed: %s\n", strerror(errno));
+    //}
+    //c->tbuf = malloc(4*1024*1024);
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
     return c;
@@ -888,7 +902,9 @@ static void conn_close(conn *c) {
     }
 
     /* delete the event, the socket and the conn */
-    event_del(&c->event);
+    if (!settings.use_io_uring) {
+        event_del(&c->event);
+    }
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
@@ -1427,6 +1443,9 @@ static void reset_cmd_handler(conn *c) {
         c->item = NULL;
     }
     if (c->rbytes > 0) {
+        if (settings.use_io_uring) {
+            fprintf(stderr, "ERROR: reset_cmd_handler called with rbytes > 0 on %d\n", c->sfd);
+        }
         conn_set_state(c, conn_parse_cmd);
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
@@ -2968,7 +2987,36 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
+//static void accept_complete(struct io_uring_op_ctx *op, int res) {
+//    if (res >= 0) {
+//        int new_sfd = res;
+//        // Create a new connection object for this sfd
+//        //conn *c = conn_new(new_sfd, ...);
+//
+//        // Queue the first recv for the new connection
+//        //if (c) {
+//        //    queue_recv(c);
+//        //}
+//
+//        // IMPORTANT: Queue the next accept operation
+//        queue_accept();
+//    }
+//    free(op);
+//}
 
+static void queue_accept(void) {
+    struct io_uring_op_ctx *op = malloc(sizeof(struct io_uring_op_ctx));
+    op->c = NULL; // No specific connection yet
+    op->type = OP_ACCEPT;
+    //op->handler = accept_complete;
+
+    //struct io_uring_sqe *sqe = io_uring_get_sqe(main_thread->ring); // Or wherever the main ring is
+
+    // 'sfd' is the main listening socket for the server
+    //io_uring_prep_accept(sqe, sfd, NULL, NULL, 0);
+    //io_uring_sqe_set_data(sqe, op);
+    //io_uring_submit(main_thread->ring);
+}
 
 /* Return true if we advanced the state-machine (parsed ≥ 1 command).      */
 /* Return false if we stopped because we need more bytes or hit an error. */
@@ -2995,66 +3043,45 @@ static bool try_parse_some(conn *c)
     return progress;
 }
 
-/* Submit the next RECV SQE exactly once.  Assumes no other RECV is armed. */
-static void queue_next_if_needed(conn *c)
-{
-    /* 1.  Are we in the middle of reading the value section of a SET/ADD?  */
-    if (c->state == conn_nread && c->rlbytes > 0) {
-        /* Need exactly rlbytes more to finish the item body.               */
-        queue_recv_exact(c, c->rlbytes);   /* → IORING_OP_RECV w/ len=rlbytes */
-        return;
-    }
-
-    /* 2.  Waiting for the next command header (conn_waiting).              */
-    if (c->state == conn_waiting || c->state == conn_parse_cmd) {
-        queue_recv(c);                     /* generic RECV (up to rsize)     */
-        return;
-    }
-
-    /* 3.  Nothing to do – either closing or we just queued a SEND.         */
-}
-
 
 static void recv_complete(struct io_uring_op_ctx *op, int res)
 {
     conn *c = op->c;
-    free(op);
+    do_cache_free(c->thread->io_uring_cache, op);
 
+    //res > 0 means we read data, that means we should go to 
+    //conn_parse_cmd state
     if (res > 0) {
-        c->rbytes += res;            /* bytes now in rbuf                */
-
-        /* 1.  If we were reading the value body, update rlbytes. */
         if (c->state == conn_nread) {
-            c->rlbytes -= res;
-            if (c->rlbytes == 0)
-                complete_nread(c);   /* same function as before */
+            if (c->rcurr == c->ritem) {
+                c->rcurr += res;
+            }
+            c->ritem += res; /* move the ritem pointer */
+            c->rlbytes -= res;     /* update the number of bytes left */
+            
+        } else {
+            c->rbytes += res;          /* update the number of bytes read */
+            conn_set_state(c, conn_parse_cmd);
         }
-
-        /* 2.  Try to parse whatever is available. */
-        try_parse_some(c);
-
-        /* 3.  Arm the next recv if needed. */
-        queue_next_if_needed(c);
-
-        /* 4.  Re-enter the state-machine for any synchronous work. */
-        drive_machine(c);
-
     } else if (res == 0) {           /* peer closed cleanly */
         c->close_reason = NORMAL_CLOSE;
         conn_set_state(c, conn_closing);
-        drive_machine(c);
     } else {                         /* res < 0  ⇒  -errno   */
         errno = -res;
         conn_set_state(c, conn_closing);
-        drive_machine(c);
     }
+    drive_machine(c);
 }
 
 
-static void queue_recv(conn *c)
+void queue_recv(conn *c, void* buf, size_t len)
 {
     //todo make this a thread local allocator like rbuf_cache
-    struct io_uring_op_ctx *op = malloc(sizeof(struct io_uring_op_ctx));
+    struct io_uring_op_ctx *op = do_cache_alloc(c->thread->io_uring_cache);
+    if (!op) {
+        fprintf(stderr, "Failed to allocate io_uring_op_ctx for recv operation.\n");
+        exit(EXIT_FAILURE);
+    }
     op->c       = c;
     op->type    = OP_RECV;
     op->handler = recv_complete;
@@ -3062,10 +3089,17 @@ static void queue_recv(conn *c)
     struct io_uring_sqe *sqe =
         io_uring_get_sqe(c->thread->ring);  /* ring is per worker */
 
-    io_uring_prep_recv(sqe, c->sfd, 
-                      c->rcurr, c->rsize - c->rbytes,
-                       0);
+    if (buf == NULL) {
+        rbuf_alloc(c); /* ensure rbuf is allocated */
+        len = c->rsize; /* use the default rbuf size */
+        io_uring_prep_recv(sqe, c->sfd, c->rcurr, c->rsize, 0); 
+    } else {
+        io_uring_prep_recv(sqe, c->sfd, buf, len, 0);
+    }
+
     io_uring_sqe_set_data(sqe, op);          /* attaches context  */
+    io_uring_submit(c->thread->ring); /* submit the SQE */
+
 }
 
 static void queue_recv_exact(conn *c, size_t len)
@@ -3083,7 +3117,7 @@ static void queue_recv_exact(conn *c, size_t len)
 }
 
 
-static void drive_machine(conn *c) {
+void drive_machine(conn *c) {
     bool stop = false;
     int sfd;
     socklen_t addrlen;
@@ -3103,72 +3137,76 @@ static void drive_machine(conn *c) {
 
         switch(c->state) {
         case conn_listening:
-            addrlen = sizeof(addr);
+            //if (settings.use_io_uring) {
+            //    fprintf(stderr, "Cannot accept new connections with io_uring enabled (tid: %d).\n", pthread_self());
+            //} else {
+                addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
-            if (use_accept4) {
-                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
-            } else {
-                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-            }
-#else
-            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
-#endif
-            if (sfd == -1) {
-                if (use_accept4 && errno == ENOSYS) {
-                    use_accept4 = 0;
-                    continue;
-                }
-                perror(use_accept4 ? "accept4()" : "accept()");
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* these are transient, so don't log anything */
-                    stop = true;
-                } else if (errno == EMFILE) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Too many open connections\n");
-                    accept_new_conns(false);
-                    stop = true;
+                if (use_accept4) {
+                    sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
                 } else {
-                    perror("accept()");
-                    stop = true;
+                    sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
                 }
-                break;
-            }
-            if (!use_accept4) {
-                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
-                    perror("setting O_NONBLOCK");
-                    close(sfd);
+#else
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+                if (sfd == -1) {
+                    if (use_accept4 && errno == ENOSYS) {
+                        use_accept4 = 0;
+                        continue;
+                    }
+                    perror(use_accept4 ? "accept4()" : "accept()");
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        /* these are transient, so don't log anything */
+                        stop = true;
+                    } else if (errno == EMFILE) {
+                        if (settings.verbose > 0)
+                            fprintf(stderr, "Too many open connections\n");
+                        accept_new_conns(false);
+                        stop = true;
+                    } else {
+                        perror("accept()");
+                        stop = true;
+                    }
                     break;
                 }
-            }
+                if (!use_accept4) {
+                    if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                        perror("setting O_NONBLOCK");
+                        close(sfd);
+                        break;
+                    }
+                }
 
-            bool reject;
-            if (settings.maxconns_fast) {
-                reject = sfd >= settings.maxconns - 1;
+                bool reject;
+                if (settings.maxconns_fast) {
+                    reject = sfd >= settings.maxconns - 1;
+                    if (reject) {
+                        STATS_LOCK();
+                        stats.rejected_conns++;
+                        STATS_UNLOCK();
+                    }
+                } else {
+                    reject = false;
+                }
+
                 if (reject) {
-                    STATS_LOCK();
-                    stats.rejected_conns++;
-                    STATS_UNLOCK();
-                }
-            } else {
-                reject = false;
-            }
-
-            if (reject) {
-                str = "ERROR Too many open connections\r\n";
-                res = write(sfd, str, strlen(str));
-                close(sfd);
-            } else {
-                // run accept routine if ssl is compiled + enabled
-                bool fail = false;
-                void *ssl_v = ssl_accept(c, sfd, &fail);
-                if (fail) {
+                    str = "ERROR Too many open connections\r\n";
+                    res = write(sfd, str, strlen(str));
                     close(sfd);
-                    break;
-                }
+                } else {
+                    // run accept routine if ssl is compiled + enabled
+                    bool fail = false;
+                    void *ssl_v = ssl_accept(c, sfd, &fail);
+                    if (fail) {
+                        close(sfd);
+                        break;
+                    }
 
-                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
-            }
+                    dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                         READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
+                }
+            //}
 
             stop = true;
             break;
@@ -3177,7 +3215,7 @@ static void drive_machine(conn *c) {
             rbuf_release(c);
             if (settings.use_io_uring) {
                 // If we use io_uring, we can queue a recv operation.
-                queue_recv(c);
+                queue_recv(c, NULL, 0);
             } else {
                 // Otherwise, we need to update the event to read.
                 if (!update_event(c, EV_READ | EV_PERSIST)) {
@@ -3186,12 +3224,13 @@ static void drive_machine(conn *c) {
                     conn_set_state(c, conn_closing);
                     break;
                 }
+                conn_set_state(c, conn_read);
             }
-            conn_set_state(c, conn_read);
             stop = true;
             break;
 
         case conn_read:
+            assert(settings.use_io_uring == false);
             if (!IS_UDP(c->transport)) {
                 // Assign a read buffer if necessary.
                 if (!rbuf_alloc(c)) {
@@ -3295,7 +3334,11 @@ static void drive_machine(conn *c) {
                         break;
                     }
                 }
-
+                if (settings.use_io_uring) {
+                    queue_recv(c, c->ritem, c->rlbytes);
+                    stop = true;
+                    break;
+                }
                 /*  now try reading from the socket */
                 res = c->read(c, c->tbuf, c->rlbytes);
                 printf("tried %d but read %d bytes into tbuf\n", c->rlbytes, res);
@@ -3736,7 +3779,7 @@ static int server_socket(const char *interface,
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL, conntag, bproto))) {
+                                             transport, main_base, NULL, conntag, bproto, false))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -4010,7 +4053,8 @@ static int server_socket_unix(const char *path, int access_mask) {
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
+                                 local_transport, main_base, NULL, 0, settings.binding_protocol,
+                                 false))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }

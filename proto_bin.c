@@ -762,6 +762,9 @@ static void process_bin_sasl_auth(conn *c) {
     c->ritem = ITEM_data(it);
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_reading_sasl_auth_data;
 }
 
@@ -1183,6 +1186,9 @@ static void process_bin_update(conn *c, char *extbuf) {
 #endif
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_read_set_value;
 }
 
@@ -1246,6 +1252,9 @@ static void process_bin_append_prepend(conn *c) {
 #endif
     c->rlbytes = vlen;
     conn_set_state(c, conn_nread);
+    //if (settings.use_io_uring) {
+    //    queue_recv(c, c->ritem, vlen);
+    //}
     c->substate = bin_read_set_value;
 }
 
