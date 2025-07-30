@@ -636,9 +636,27 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
 
     struct io_uring_cqe *cqe;
     unsigned head;
+    int i = 0;
     io_uring_for_each_cqe(me->ring, head, cqe) {
         struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+        if (settings.verbose > 2) {
+            char *type = "unknown";
+            switch (op->type) {
+                case OP_RECV:
+                    type = "recv";
+                    break;
+                default:
+                    type = "unknown";
+                    break;
+            }
+            fprintf(stderr, "[io_uring] thread %lu processing event type: %s res=%d\n",
+                    (unsigned long)pthread_self(), type, cqe->res);
+        }
         op->handler(op, cqe->res);
+        i++;
+    }
+    if (settings.verbose > 2) {
+        fprintf(stderr, "Worker %ld processed %d IO events\n", me->thread_id, i);
     }
     io_uring_cq_advance(me->ring, io_uring_cq_ready(me->ring));
 }

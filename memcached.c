@@ -1451,6 +1451,9 @@ static void reset_cmd_handler(conn *c) {
         conn_set_state(c, conn_mwrite);
     } else {
         conn_set_state(c, conn_waiting);
+        //if (settings.use_io_uring) {
+        //    queue_recv(c, NULL, 0);
+        //}
     }
 }
 
@@ -3063,6 +3066,10 @@ static void recv_complete(struct io_uring_op_ctx *op, int res)
             c->rbytes += res;          /* update the number of bytes read */
             conn_set_state(c, conn_parse_cmd);
         }
+        if (settings.verbose > 2) {
+            char *state = state_text(c->state);
+            fprintf(stderr, "Received %d bytes on fd %d, remain %d, state %s\n", res, c->sfd, c->rlbytes, state);
+        }
     } else if (res == 0) {           /* peer closed cleanly */
         c->close_reason = NORMAL_CLOSE;
         conn_set_state(c, conn_closing);
@@ -3099,6 +3106,9 @@ void queue_recv(conn *c, void* buf, size_t len)
 
     io_uring_sqe_set_data(sqe, op);          /* attaches context  */
     io_uring_submit(c->thread->ring); /* submit the SQE */
+    if (settings.verbose > 2) {
+        fprintf(stderr, "Queued recv on fd %d, len %zu\n", c->sfd, len);
+    }
 
 }
 
@@ -3335,6 +3345,9 @@ void drive_machine(conn *c) {
                     }
                 }
                 if (settings.use_io_uring) {
+		    if (settings.verbose > 2) {
+	                 fprintf(stderr, "queieng recv for %d\n", c->rlbytes);
+		    }
                     queue_recv(c, c->ritem, c->rlbytes);
                     stop = true;
                     break;
