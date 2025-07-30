@@ -559,6 +559,21 @@ static void *worker_libevent(void *arg) {
         //if (settings.verbose > 2) {
         //    fprintf(stderr, "Worker %d processed %d IO events\n", me->thread_id, i);
         //}
+        //
+	if (settings.use_io_uring) {
+            int ready = io_uring_sq_ready(me->ring);
+            if (ready > 0) {
+                if (settings.verbose > 2) {
+                    fprintf(stderr, "[io_uring] thread %lu ready events: %d\n",
+                            (unsigned long)pthread_self(), ready);
+                }
+                int ret = io_uring_submit(me->ring);
+                if (ret < 0) {
+                    fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+                            (unsigned long)pthread_self(), strerror(-ret));
+                }
+            }
+	}
         // Run IO queues after the event loop to catch things like
         // re-submissions from proxy callbacks.
         thread_io_queue_submit(me);

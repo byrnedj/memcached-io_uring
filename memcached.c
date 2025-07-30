@@ -3105,26 +3105,13 @@ void queue_recv(conn *c, void* buf, size_t len)
     }
 
     io_uring_sqe_set_data(sqe, op);          /* attaches context  */
-    io_uring_submit(c->thread->ring); /* submit the SQE */
+    //io_uring_submit(c->thread->ring); /* submit the SQE */
     if (settings.verbose > 2) {
         fprintf(stderr, "Queued recv on fd %d, len %zu\n", c->sfd, len);
     }
 
 }
 
-static void queue_recv_exact(conn *c, size_t len)
-{
-    struct io_uring_op_ctx *op = malloc(sizeof(struct io_uring_op_ctx));
-    op->c       = c;
-    op->type    = OP_RECV;
-    op->handler = recv_complete;
-
-    struct io_uring_sqe *sqe =
-        io_uring_get_sqe(c->thread->ring);
-
-    io_uring_prep_recv(sqe, c->sfd, c->ritem, len, MSG_WAITALL);
-    io_uring_sqe_set_data(sqe, op);
-}
 
 
 void drive_machine(conn *c) {
