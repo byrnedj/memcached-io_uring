@@ -428,7 +428,7 @@ static void setup_thread_io_uring_notify(LIBEVENT_THREAD *me,
     io_uring_register_eventfd(me->ring, me->io_uring_fd);
     fprintf(stderr,
         "[io_uring] thread %lu init: ring=%p eventfd=%d depth=%d\n",
-        (unsigned long)pthread_self(),
+        (unsigned long)me->thread_id,
         me->ring,
         me->io_uring_fd,
         settings.io_uring_depth);
@@ -546,31 +546,23 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
     while (!event_base_got_exit(me->base)) {
-        //event_base_dump_events(me->base, stderr);
-        event_base_loop(me->base, EVLOOP_ONCE);
-        //struct io_uring_cqe *cqe;
-        //unsigned int head;
-        //int i = 0;
-        //io_uring_for_each_cqe(me->ring, head, cqe) {
-        //    struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
-        //    op->handler(op, cqe->res);
-        //    i++;
-        //}
-        //if (settings.verbose > 2) {
-        //    fprintf(stderr, "Worker %d processed %d IO events\n", me->thread_id, i);
-        //}
-        //
+        int ev_ret = event_base_loop(me->base,EVLOOP_ONCE);
+        if (ev_ret < 0) {
+            fprintf(stderr, "Event base loop returned error: %s\n",
+                    evutil_socket_error_to_string(ev_ret));
+            break;
+        }
 	if (settings.use_io_uring) {
             int ready = io_uring_sq_ready(me->ring);
             if (ready > 0) {
                 if (settings.verbose > 2) {
                     fprintf(stderr, "[io_uring] thread %lu ready events: %d\n",
-                            (unsigned long)pthread_self(), ready);
+                            (unsigned long)me->thread_id, ready);
                 }
                 int ret = io_uring_submit(me->ring);
                 if (ret < 0) {
                     fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
-                            (unsigned long)pthread_self(), strerror(-ret));
+                            (unsigned long)me->thread_id, strerror(-ret));
                 }
             }
 	}
@@ -665,15 +657,29 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
                     break;
             }
             fprintf(stderr, "[io_uring] thread %lu processing event type: %s res=%d\n",
-                    (unsigned long)pthread_self(), type, cqe->res);
+                    (unsigned long)me->thread_id, type, cqe->res);
         }
         op->handler(op, cqe->res);
         i++;
     }
     if (settings.verbose > 2) {
-        fprintf(stderr, "Worker %ld processed %d IO events\n", me->thread_id, i);
+        fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
     }
-    io_uring_cq_advance(me->ring, io_uring_cq_ready(me->ring));
+    io_uring_cq_advance(me->ring, i);
+    int ready = io_uring_sq_ready(me->ring);
+    if (ready > 0) {
+        if (settings.verbose > 2) {
+            fprintf(stderr, "[io_uring] thread %lu ready events: %d, processed %d\n",
+                    (unsigned long)me->thread_id, ready, i);
+        }
+        int ret = io_uring_submit(me->ring);
+        if (ret < 0) {
+            fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+                    (unsigned long)me->thread_id, strerror(-ret));
+        }
+    }
+
+
 }
 
 /*
@@ -738,9 +744,10 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     //at this point, the connection is fully initialized
                     if (settings.use_io_uring) {
                         assert(c->state == conn_new_cmd);
-                        queue_recv(c, NULL, 0);
                         //here we can prep recv the data
-                        //drive_machine(c);
+                        drive_machine(c);
+                        io_uring_submit(c->thread->ring); /* submit the SQE */
+                        //queue_recv(c, NULL, 0);
 
                         //setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
                     }

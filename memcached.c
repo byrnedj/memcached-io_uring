@@ -3339,6 +3339,8 @@ void drive_machine(conn *c) {
                     stop = true;
                     break;
                 }
+                int *a = 0;
+                *a = 0;
                 /*  now try reading from the socket */
                 res = c->read(c, c->tbuf, c->rlbytes);
                 printf("tried %d but read %d bytes into tbuf\n", c->rlbytes, res);
