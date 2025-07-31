@@ -546,14 +546,14 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
     while (!event_base_got_exit(me->base)) {
-        int ev_ret = event_base_loop(me->base,EVLOOP_ONCE);
+        int ev_ret = event_base_loop(me->base, EVLOOP_ONCE);
         if (ev_ret < 0) {
             fprintf(stderr, "Event base loop returned error: %s\n",
                     evutil_socket_error_to_string(ev_ret));
             break;
         }
-	if (settings.use_io_uring) {
-            int ready = io_uring_sq_ready(me->ring);
+        if (settings.use_io_uring) {
+        int ready = io_uring_sq_ready(me->ring);
             if (ready > 0) {
                 if (settings.verbose > 2) {
                     fprintf(stderr, "[io_uring] thread %lu ready events: %d\n",
@@ -565,7 +565,7 @@ static void *worker_libevent(void *arg) {
                             (unsigned long)me->thread_id, strerror(-ret));
                 }
             }
-	}
+        }
         // Run IO queues after the event loop to catch things like
         // re-submissions from proxy callbacks.
         thread_io_queue_submit(me);
@@ -666,18 +666,6 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
         fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
     }
     io_uring_cq_advance(me->ring, i);
-    int ready = io_uring_sq_ready(me->ring);
-    if (ready > 0) {
-        if (settings.verbose > 2) {
-            fprintf(stderr, "[io_uring] thread %lu ready events: %d, processed %d\n",
-                    (unsigned long)me->thread_id, ready, i);
-        }
-        int ret = io_uring_submit(me->ring);
-        if (ret < 0) {
-            fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
-                    (unsigned long)me->thread_id, strerror(-ret));
-        }
-    }
 
 
 }
@@ -744,12 +732,10 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     //at this point, the connection is fully initialized
                     if (settings.use_io_uring) {
                         assert(c->state == conn_new_cmd);
-                        //here we can prep recv the data
+                        //here we can prep recv the data via the 
+                        //drive_machine() since the state will go to 
+                        //new_cmd then conn_waiting
                         drive_machine(c);
-                        io_uring_submit(c->thread->ring); /* submit the SQE */
-                        //queue_recv(c, NULL, 0);
-
-                        //setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
                     }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
