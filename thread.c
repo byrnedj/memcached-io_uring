@@ -19,6 +19,8 @@
 #include <pthread.h>
 #include <linux/io_uring.h>
 #include <liburing.h>
+#include <sys/mman.h>
+#include <math.h>
 #include "queue.h"
 #include "tls.h"
 
@@ -27,6 +29,8 @@
 #endif
 
 #define ITEMS_PER_ALLOC 64
+#define NUM_IO_BUFFERS 1024
+#define IO_BUFFER_SIZE 32*1024
 
 /* An item in the connection queue. */
 enum conn_queue_item_modes {
@@ -475,7 +479,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
 
 
     me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *));
-    me->io_uring_cache = cache_create("io_uring", sizeof(struct io_uring_op_ctx) * 1000, sizeof(struct io_uring_op_ctx));
+    me->io_uring_cache = cache_create("io_uring", sizeof(struct io_uring_op_ctx) * 2048, sizeof(struct io_uring_op_ctx));
     if (me->rbuf_cache == NULL || me->io_uring_cache == NULL) {
         fprintf(stderr, "Failed to create read buffer or io_uring op cache\n");
         exit(EXIT_FAILURE);
@@ -553,7 +557,7 @@ static void *worker_libevent(void *arg) {
             break;
         }
         if (settings.use_io_uring) {
-        int ready = io_uring_sq_ready(me->ring);
+            int ready = io_uring_sq_ready(me->ring);
             if (ready > 0) {
                 if (settings.verbose > 2) {
                     fprintf(stderr, "[io_uring] thread %lu ready events: %d\n",
@@ -624,6 +628,13 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
     }
 }
 
+static uint8_t* get_buffer_base_addr(void* ring_addr) {
+    return (uint8_t*)ring_addr + (sizeof(struct io_uring_buf) * NUM_IO_BUFFERS);
+}
+
+static uint8_t* get_buffer_addr(uint8_t* base_addr, uint16_t idx) {
+    return base_addr + (idx << (int)log2(IO_BUFFER_SIZE));
+}
 
 /*
  * Processes an incoming "connection event" item. This is called when
@@ -646,6 +657,9 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
     int i = 0;
     io_uring_for_each_cqe(me->ring, head, cqe) {
         struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+        const uint16_t buffer_idx = cqe->flags >> 16;
+        const void* addr = get_buffer_addr(me->io_uring_buffers_base, buffer_idx);
+        op->buffer = addr;
         if (settings.verbose > 2) {
             char *type = "unknown";
             switch (op->type) {
@@ -665,7 +679,11 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
     if (settings.verbose > 2) {
         fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
     }
-    io_uring_cq_advance(me->ring, i);
+    if (settings.use_multishot) {
+        io_uring_buf_ring_cq_advance(me->ring, me->io_uring_buffers_base, i);
+    } else {
+        io_uring_cq_advance(me->ring, i);
+    }
 
 
 }
@@ -736,6 +754,10 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                         //drive_machine() since the state will go to 
                         //new_cmd then conn_waiting
                         drive_machine(c);
+                        //we are going to try multishot - here we will prep the
+                        //multishot recv and submit it, then we should get an
+                        //event notify every time there is a new CQE 
+
                     }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
@@ -1173,6 +1195,7 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 #endif
 }
 
+
 static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
     int ret;
     me->ring = malloc(sizeof(struct io_uring));
@@ -1182,7 +1205,57 @@ static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
         exit(EXIT_FAILURE);
     }
     me->io_uring_fd = eventfd(0, EFD_NONBLOCK);
+    //we need to setup the registered buffers
+    if (settings.use_multishot) {
+        // From: https://unixism.net/loti/ref-iouring/io_uring_register.html
+        // Currently, the buffers must be anonymous, non-file-backed memory, such as that returned by malloc(3) or
+        // mmap(2) with the MAP_ANONYMOUS flag set. It is expected that this limitation will be lifted in the
+        // future
+        int ring_size = IO_BUFFER_SIZE;
+        void* ring_addr =
+            mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+        // mmap: If addr is nullptr, then the kernel chooses the (page-aligned) address at which to create the
+        // mapping
+        if (ring_addr == MAP_FAILED) {
+            fprintf(stderr, "Failed to mmap buffer ring: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+    
+        struct io_uring_buf_reg reg;
+        memset(&reg, 0, sizeof(reg));
+        reg.ring_addr = (uint64_t)ring_addr;
+        reg.ring_entries = NUM_IO_BUFFERS;
+        reg.bgid = 0;
+    
+        const unsigned flags = 0;
+        const int register_buf_ring_result = io_uring_register_buf_ring(me->ring, &reg, flags);
+        if (register_buf_ring_result != 0) {
+            fprintf(stderr, "Failed to register buffer ring: %s\n", strerror(-register_buf_ring_result));
+            exit(EXIT_FAILURE);
+        }
+    
+        struct io_uring_buf_ring* buf_ring = (struct io_uring_buf_ring*)(ring_addr);
+        io_uring_buf_ring_init(buf_ring);
+    
+        // Start of the actual buffer memory
+        uint8_t* buffer_base_addr = get_buffer_base_addr(ring_addr);
+    
+        // Add all buffers to a shared buffer ring
+        for (uint16_t buffer_idx = 0; buffer_idx < NUM_IO_BUFFERS; ++buffer_idx) {
+            // https://man7.org/linux/man-pages/man3/io_uring_buf_ring_add.3.html
+            io_uring_buf_ring_add(buf_ring, get_buffer_addr(buffer_base_addr, /* bid */ buffer_idx),
+                                  IO_BUFFER_SIZE, buffer_idx,
+                                  io_uring_buf_ring_mask(NUM_IO_BUFFERS),
+                                  /* buf_offset */ buffer_idx);
+        }
+        // Store the base address of the buffers in the thread struct 
+        me->io_uring_buffers_base = buffer_base_addr;
+        // Make 'count' new buffers visible to the kernel. Called after io_uring_buf_ring_add() has been called
+        // 'count' times to fill in new buffers.
+        io_uring_buf_ring_advance(buf_ring, NUM_IO_BUFFERS);
+    }
 }
+
 
 /*
  * Initializes the thread subsystem, creating various worker threads.

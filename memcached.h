@@ -473,6 +473,7 @@ struct settings {
                                io-event. */
     bool use_cas;
     bool use_io_uring;
+    bool use_multishot;
     int io_uring_depth;
     enum protocol binding_protocol;
     int backlog;
@@ -738,6 +739,7 @@ typedef struct {
     mc_resp_bundle *open_bundle;
     cache_t *io_cache;          /* IO objects */
     struct io_uring *ring;      /* io_uring ring for this thread */
+    void *io_uring_buffers_base;            /* io_uring fd for this thread */
 #ifdef EXTSTORE
     void *storage;              /* data object for storage system */
 #endif
@@ -921,6 +923,7 @@ enum io_uring_op_type { OP_ACCEPT, OP_RECV, OP_SEND };
 
 struct io_uring_op_ctx {
     conn                *c;        /* owning connection              */
+    void *buffer;
     enum io_uring_op_type         type;     /* what the SQE is doing          */
     void (*handler)(struct io_uring_op_ctx *op, int res);
                                      /* completion callback          */

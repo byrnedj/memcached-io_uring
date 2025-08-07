@@ -216,6 +216,7 @@ void stats_reset(void) {
 
 static void settings_init(void) {
     settings.use_io_uring = false;
+    settings.use_multishot = false;
     settings.io_uring_depth = 1024; /* default io_uring depth */
     settings.use_cas = true;
     settings.access = 0700;
@@ -2994,16 +2995,25 @@ static void recv_complete(struct io_uring_op_ctx *op, int res)
     //res > 0 means we read data, that means we should go to 
     //conn_parse_cmd state
     if (res > 0) {
-        if (c->state == conn_nread) {
-            if (c->rcurr == c->ritem) {
-                c->rcurr += res;
-            }
-            c->ritem += res; /* move the ritem pointer */
-            c->rlbytes -= res;     /* update the number of bytes left */
-            
-        } else {
+        if (settings.use_multishot) {
+            c->rcurr = op->buffer; /* use the buffer we got from the multishot */
+            c->rbuf = c->rcurr;
             c->rbytes += res;          /* update the number of bytes read */
-            conn_set_state(c, conn_parse_cmd);
+            if (c->state == conn_waiting) {
+                conn_set_state(c, conn_parse_cmd);
+            }
+        } else {
+            if (c->state == conn_nread) {
+                if (c->rcurr == c->ritem) {
+                    c->rcurr += res;
+                }
+                c->ritem += res; /* move the ritem pointer */
+                c->rlbytes -= res;     /* update the number of bytes left */
+                
+            } else {
+                c->rbytes += res;          /* update the number of bytes read */
+                conn_set_state(c, conn_parse_cmd);
+            }
         }
         if (settings.verbose > 2) {
             char *state = state_text(c->state);
@@ -3034,13 +3044,18 @@ void queue_recv(conn *c, void* buf, size_t len)
     struct io_uring_sqe *sqe =
         io_uring_get_sqe(c->thread->ring);  /* ring is per worker */
 
-    if (buf == NULL) {
+    if (buf == NULL && !settings.use_multishot) {
         if (!rbuf_alloc(c)) {
             fprintf(stderr, "Failed to allocate read buffer for connection %d.\n", c->sfd);
             exit(EXIT_FAILURE);
         }
         len = c->rsize; /* use the default rbuf size */
         io_uring_prep_recv(sqe, c->sfd, c->rcurr, c->rsize, 0); 
+    } else if (buf == NULL && settings.use_multishot) {
+        io_uring_prep_recv_multishot(sqe, c->sfd, NULL, 0, 0);
+        sqe->flags |= IOSQE_BUFFER_SELECT; 
+        sqe->buf_group = 0; /* use the default buffer group */
+        //sqe->ioprio |= IORING_RECVSEND_BUNDLE; 
     } else {
         io_uring_prep_recv(sqe, c->sfd, buf, len, 0);
     }
@@ -3049,6 +3064,13 @@ void queue_recv(conn *c, void* buf, size_t len)
     if (settings.verbose > 2) {
         fprintf(stderr, "Queued recv on fd %d, len %zu\n", c->sfd, len);
     }
+    //if (settings.use_multishot) {
+    //    int ret = io_uring_submit(c->thread->ring);
+    //    if (ret < 0) {
+    //        fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+    //                (unsigned long)c->thread->thread_id, strerror(-ret));
+    //    }
+    //}
 
 }
 
@@ -3256,6 +3278,8 @@ void drive_machine(conn *c) {
 
             if (c->item_malloced || ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) ) {
                 /* first check if we have leftovers in the conn_read buffer */
+                //if (c->rbytes > 0 && !settings.use_multishot) {
+                //TODO: debug this for multishot
                 if (c->rbytes > 0) {
                     int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
                     memmove(c->ritem, c->rcurr, tocopy);
@@ -3263,7 +3287,10 @@ void drive_machine(conn *c) {
                     c->rlbytes -= tocopy;
                     c->rcurr += tocopy;
                     c->rbytes -= tocopy;
-                    if (c->rlbytes == 0) {
+                    if (c->rlbytes == 0 || settings.use_multishot) {
+                        if (settings.use_multishot) {
+                            stop = true;
+                        }
                         break;
                     }
                 }
@@ -5007,6 +5034,7 @@ int main (int argc, char **argv) {
           "B:"  /* Binding protocol */
           "I:"  /* Max item size */
           "O"   /* Enable io_uring */
+          "T"   /* Enable io_uring with multishot */
           "Q:"   /* io_uring_q_depth */
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
@@ -5136,6 +5164,9 @@ int main (int argc, char **argv) {
             break;
         case 'O':
             settings.use_io_uring = true;
+            break;
+        case 'T':
+            settings.use_multishot = true;
             break;
         case 'Q':
             settings.io_uring_depth = atoi(optarg);
