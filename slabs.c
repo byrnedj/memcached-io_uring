@@ -6,6 +6,7 @@
  * a multiplier factor from there, up to half the maximum slab size.
  */
 #include "memcached.h"
+#include <linux/mman.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -96,47 +97,65 @@ static void * alloc_large_chunk(const size_t limit)
 {
     void *ptr = NULL;
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-    size_t pagesize = 0;
-    FILE *fp;
-    int ret;
+    //size_t pagesize = 0;
+    //FILE *fp;
+    //int ret;
 
-    /* Get the size of huge pages */
-    fp = fopen("/proc/meminfo", "r");
-    if (fp != NULL) {
-        char buf[64];
+    ///* Get the size of huge pages */
+    //fp = fopen("/proc/meminfo", "r");
+    //if (fp != NULL) {
+    //    char buf[64];
 
-        while ((fgets(buf, sizeof(buf), fp)))
-            if (!strncmp(buf, "Hugepagesize:", 13)) {
-                ret = sscanf(buf + 13, "%zu\n", &pagesize);
+    //    while ((fgets(buf, sizeof(buf), fp)))
+    //        if (!strncmp(buf, "Hugepagesize:", 13)) {
+    //            ret = sscanf(buf + 13, "%zu\n", &pagesize);
 
-                /* meminfo huge page size is in KiBs */
-                pagesize <<= 10;
-            }
-        fclose(fp);
+    //            /* meminfo huge page size is in KiBs */
+    //            pagesize <<= 10;
+    //        }
+    //    fclose(fp);
+    //}
+
+    //if (!pagesize) {
+    //    fprintf(stderr, "Failed to get supported huge page size\n");
+    //    return NULL;
+    //}
+
+    //if (settings.verbose > 1)
+    //    fprintf(stderr, "huge page size: %zu\n", pagesize);
+
+    ///* This works because glibc simply uses mmap when the alignment is
+    // * above a certain limit. */
+    //ret = posix_memalign(&ptr, pagesize, limit);
+    //if (ret != 0) {
+    //    fprintf(stderr, "Failed to get aligned memory chunk: %d\n", ret);
+    //    return NULL;
+    //}
+
+    //ret = madvise(ptr, limit, MADV_HUGEPAGE);
+    //if (ret < 0) {
+    //    fprintf(stderr, "Failed to set transparent hugepage hint: %d\n", ret);
+    //    free(ptr);
+    //    ptr = NULL;
+    //}
+
+    //ret = madvise(ptr, limit, MADV_POPULATE_WRITE);
+    //if (ret < 0) {
+    //    fprintf(stderr, "Failed to populate hugepage hint: %d\n", ret);
+    //    free(ptr);
+    //    ptr = NULL;
+    //}
+    ptr = mmap(NULL, limit, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB | MAP_POPULATE,
+			-1, 0);
+    if (settings.verbose > 1) {
+	fprintf(stderr, "using mmap\n");
     }
+		if (ptr == MAP_FAILED) {
+			printf("mmap failed, exiting\n");
+			exit(1);
+		}
 
-    if (!pagesize) {
-        fprintf(stderr, "Failed to get supported huge page size\n");
-        return NULL;
-    }
-
-    if (settings.verbose > 1)
-        fprintf(stderr, "huge page size: %zu\n", pagesize);
-
-    /* This works because glibc simply uses mmap when the alignment is
-     * above a certain limit. */
-    ret = posix_memalign(&ptr, pagesize, limit);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to get aligned memory chunk: %d\n", ret);
-        return NULL;
-    }
-
-    ret = madvise(ptr, limit, MADV_HUGEPAGE);
-    if (ret < 0) {
-        fprintf(stderr, "Failed to set transparent hugepage hint: %d\n", ret);
-        free(ptr);
-        ptr = NULL;
-    }
 #elif defined(__FreeBSD__)
     size_t align = (sizeof(size_t) * 8 - (__builtin_clzl(4095)));
     ptr = mmap(NULL, limit, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_ALIGNED(align) | MAP_ALIGNED_SUPER, -1, 0);
@@ -145,6 +164,9 @@ static void * alloc_large_chunk(const size_t limit)
         ptr = NULL;
     }
 #else
+    if (settings.verbose > 1) {
+	fprintf(stderr, "using malloc\n");
+    }
     ptr = malloc(limit);
 #endif
     return ptr;

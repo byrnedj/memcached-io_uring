@@ -3050,7 +3050,9 @@ static bool try_parse_some(conn *c)
 static void recv_complete(struct io_uring_op_ctx *op, int res)
 {
     conn *c = op->c;
-    do_cache_free(c->thread->io_uring_cache, op);
+    if (c) {
+        do_cache_free(c->thread->io_uring_cache, op);
+    }
 
     //res > 0 means we read data, that means we should go to 
     //conn_parse_cmd state

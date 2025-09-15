@@ -3,7 +3,9 @@
 #include <string.h>
 #include <inttypes.h>
 #include <assert.h>
-
+#include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
 #ifndef NDEBUG
 #include <signal.h>
 #endif
@@ -14,6 +16,59 @@
 const uint64_t redzone_pattern = 0xdeadbeefcafedeed;
 int cache_error = 0;
 #endif
+
+#include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
+
+/* Touch each page and lock it.
+   IMPORTANT: we write back the same byte to force a *write* fault,
+   which allocates a private anonymous page (avoids zero-page surprises). */
+static int prefault_and_lock(void *addr, size_t len)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) return -1;
+
+    uintptr_t start = (uintptr_t)addr & ~( (uintptr_t)pg - 1 );
+    uintptr_t end   = ((uintptr_t)addr + len + pg - 1) & ~( (uintptr_t)pg - 1 );
+    size_t plen = end - start;
+    volatile unsigned char *p = (volatile unsigned char *)start;
+
+    /* Lock first so the pages we fault in become resident and stay resident */
+    if (mlock((void *)start, plen) != 0) {
+        /* EPERM/ENOMEM → raise RLIMIT_MEMLOCK or use mlockall() (see below) */
+        return -1;
+    }
+
+    /* Prefault/write-touch one byte per page */
+    for (size_t off = 0; off < plen; off += (size_t)pg) {
+        unsigned char v = p[off];
+        p[off] = v;               /* write back same value */
+    }
+    /* Optional: also fault the trailing partial page if any */
+    if (plen && ((uintptr_t)addr + len) % pg) {
+        size_t last = plen - (size_t)pg;
+        unsigned char v = p[last];
+        p[last] = v;
+    }
+
+    /* Optional hints */
+    madvise((void *)start, plen, MADV_WILLNEED);   /* harmless for anon memory */
+    madvise((void *)start, plen, MADV_DONTDUMP);   /* keep cores smaller */
+
+    return 0;
+}
+
+/* Undo at free time */
+static void unlock_region(void *addr, size_t len)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) return;
+    uintptr_t start = (uintptr_t)addr & ~( (uintptr_t)pg - 1 );
+    uintptr_t end   = ((uintptr_t)addr + len + pg - 1) & ~( (uintptr_t)pg - 1 );
+    munlock((void *)start, end - start);
+}
+
 
 cache_t* cache_create(const char *name, size_t bufsize, size_t align) {
     cache_t* ret = calloc(1, sizeof(cache_t));
@@ -83,6 +138,7 @@ void* do_cache_alloc(cache_t *cache) {
     } else if (cache->limit == 0 || cache->total < cache->limit) {
         object = ret = malloc(cache->bufsize);
         if (ret != NULL) {
+	    prefault_and_lock(ret, cache->bufsize);
             object = get_object(ret);
 
             cache->total++;
@@ -130,6 +186,7 @@ void do_cache_free(cache_t *cache, void *ptr) {
     ptr = pre;
 #endif
     if (cache->limit != 0 && cache->limit < cache->total) {
+	unlock_region(ptr, cache->bufsize);
         free(ptr);
         cache->total--;
     } else {
