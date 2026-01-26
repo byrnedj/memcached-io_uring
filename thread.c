@@ -656,52 +656,41 @@ static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, vo
     struct io_uring_cqe *cqe;
     unsigned head;
     int i = 0;
-    //while (1) {
-    //    int ret = io_uring_peek_cqe(me->ring, &cqe);
-    //    if (ret == -EINTR) {
-    //      continue;
-    //    }
-    //    if (ret == -EAGAIN || ret == -ETIME) {
-    //      ret = io_uring_wait_cqe_timeout(me->ring, &cqe, &ts);
-    //      if (ret == -ETIME || ret == -EINTR) {
-    //    	 continue;
-    //      }
-    // 
-    	io_uring_for_each_cqe(me->ring, head, cqe) {
-    	    struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
-    	    if (settings.verbose > 2) {
-    	        char *type = "unknown";
-    	        switch (op->type) {
-    	            case OP_RECV:
-    	                type = "recv";
-    	                break;
-    	            default:
-    	                type = "unknown";
-    	                break;
-    	        }
-    	        fprintf(stderr, "[io_uring] fd %d thread %lu processing event type: %s res=%d flags=0x%x\n",
-    	                fd, (unsigned long)me->thread_id, type, cqe->res, cqe->flags);
-    	    }
-    	    op->handler(op, cqe->res, cqe->flags);
-    	    i++;
-    	}
-    	if (settings.verbose > 2) {
-    	    fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
-    	}
-    	io_uring_cq_advance(me->ring, i);
-    	int ready = io_uring_sq_ready(me->ring);
-    	if (ready > 0) {
-    	    if (settings.verbose > 2) {
-    	        fprintf(stderr, "[io_uring] thread %lu evcb ready events: %d, processed %d\n",
-    	                (unsigned long)me->thread_id, ready, i);
-    	    }
-    	    int ret = io_uring_submit(me->ring);
-    	    if (ret < 0) {
-    	        fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
-    	                (unsigned long)me->thread_id, strerror(-ret));
-    	    }
-    	}
-    //}
+    io_uring_for_each_cqe(me->ring, head, cqe) {
+        struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
+        if (settings.verbose > 2) {
+            char *type = "unknown";
+            switch (op->type) {
+                case OP_RECV:
+                    type = "recv";
+                    break;
+                default:
+                    type = "unknown";
+                    break;
+            }
+            fprintf(stderr, "[io_uring] fd %d thread %lu processing event type: %s res=%d flags=0x%x\n",
+                    fd, (unsigned long)me->thread_id, type, cqe->res, cqe->flags);
+        }
+        op->handler(op, cqe->res, cqe->flags);
+        i++;
+    }
+    if (settings.verbose > 2) {
+        fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
+    }
+    io_uring_cq_advance(me->ring, i);
+    int ready = io_uring_sq_ready(me->ring);
+    if (ready > 0) {
+        if (settings.verbose > 2) {
+            fprintf(stderr, "[io_uring] thread %lu evcb ready events: %d, processed %d\n",
+                    (unsigned long)me->thread_id, ready, i);
+        }
+        int ret = io_uring_submit(me->ring);
+        if (ret < 0) {
+            fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
+                    (unsigned long)me->thread_id, strerror(-ret));
+        }
+    }
+    
 
 
 }
@@ -783,62 +772,6 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
             		                (unsigned long)me->thread_id, strerror(-ret));
             		    }
                         }
-                       // 
-		       //     
-    		       //     struct io_uring_cqe *cqe;
-    		       //     unsigned head;
-    		       // struct __kernel_timespec ts = {0};
-    		       //     int i = 0;
-		       //     while (1) {
-		       // 	int ret = io_uring_peek_cqe(me->ring, &cqe);
-		       // 	if (ret == -EINTR) {
-		       // 	  continue;
-		       // 	}
-		       // 	if (ret == -EAGAIN || ret == -ETIME) {
-		       // 	  ret = io_uring_wait_cqe_timeout(me->ring, &cqe, &ts);
-		       // 	  if (ret == -ETIME || ret == -EINTR) {
-		       // 		 continue;
-		       // 	  }
-		       // 	}
-    		       //     io_uring_for_each_cqe(me->ring, head, cqe) {
-    		       //         struct io_uring_op_ctx *op = io_uring_cqe_get_data(cqe);
-    		       //         if (settings.verbose > 2) {
-    		       //             char *type = "unknown";
-    		       //             switch (op->type) {
-    		       //                 case OP_RECV:
-    		       //                     type = "recv";
-    		       //                     break;
-    		       //                 default:
-    		       //                     type = "unknown";
-    		       //                     break;
-    		       //             }
-    		       //             fprintf(stderr, "[io_uring] thread %lu processing event type: %s res=%d\n",
-    		       //                     (unsigned long)me->thread_id, type, cqe->res);
-    		       //         }
-    		       //         op->handler(op, cqe->res);
-    		       //         i++;
-    		       //     if (settings.verbose > 2) {
-    		       //         fprintf(stderr, "Worker for fd %d, %d, processed %d IO events\n", me->io_uring_fd, fd, i);
-    		       //     }
-    		       //     io_uring_cq_advance(me->ring, i);
-    		       //     int ready = io_uring_sq_ready(me->ring);
-    		       //     if (ready > 0) {
-    		       //         if (settings.verbose > 2) {
-    		       //             fprintf(stderr, "[io_uring] thread %lu ready events: %d, processed %d\n",
-    		       //                     (unsigned long)me->thread_id, ready, i);
-    		       //         }
-    		       //         int ret = io_uring_submit(me->ring);
-    		       //         if (ret < 0) {
-    		       //             fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
-    		       //                     (unsigned long)me->thread_id, strerror(-ret));
-    		       //         }
-    		       //     }
-		       //     }
-		       //     }
-		       // }
-                       // //queue_recv(c, NULL, 0);
-
-                       // //setup_thread_io_uring_notify(me, thread_libevent_io_uring_process);
                     }
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {

@@ -1431,9 +1431,6 @@ static void reset_cmd_handler(conn *c) {
         conn_set_state(c, conn_mwrite);
     } else {
         conn_set_state(c, conn_waiting);
-        //if (settings.use_io_uring) {
-        //    queue_recv(c, NULL, 0);
-        //}
     }
 }
 
@@ -3081,8 +3078,8 @@ void queue_recv(conn *c, void* buf, size_t len)
         fprintf(stderr, "Failed to allocate io_uring_op_ctx for recv operation.\n");
         exit(EXIT_FAILURE);
     }
-    op->c       = c;
-    op->type    = OP_RECV;
+    op->c = c;
+    op->type = OP_RECV;
     op->handler = recv_complete;
     op->using_provided_buf = false;  // Default: not using provided buffers
 
