@@ -75,7 +75,7 @@
 /** Size of an incr buf. */
 #define INCR_MAX_STORAGE_LEN 24
 
-#define WRITE_BUFFER_SIZE 65536
+#define WRITE_BUFFER_SIZE 32*1024
 #define READ_BUFFER_SIZE 131072  /* 128KB */
 #define READ_BUFFER_CACHED 0
 #define IO_URING_REGISTERED_BUFFER_SIZE 131072  /* 32KB per registered buffer */
