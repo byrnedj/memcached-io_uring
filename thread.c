@@ -1351,10 +1351,38 @@ static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
             ring_entries = me->io_uring_buf_count;
         }
 
-        me->buf_ring = io_uring_setup_buf_ring(me->ring, ring_entries, me->io_uring_bgid, 0, &ret);
-        if (!me->buf_ring) {
-            fprintf(stderr, "Failed to setup io_uring buffer ring: %s\n", strerror(-ret));
-            exit(EXIT_FAILURE);
+        /* Allocate the buf_ring descriptor ring manually so we can pass
+         * IOU_PBUF_RING_DMA with the data buffer region for DMA offload.
+         */
+        {
+            size_t ring_size = (ring_entries * sizeof(struct io_uring_buf))
+                               + sizeof(struct io_uring_buf_ring);
+            void *ring_mem = NULL;
+            struct io_uring_buf_reg reg = { };
+
+            ret = posix_memalign(&ring_mem, 4096, ring_size);
+            if (ret || !ring_mem) {
+                fprintf(stderr, "Failed to allocate buf_ring descriptor ring: %s\n",
+                        strerror(ret));
+                exit(EXIT_FAILURE);
+            }
+            memset(ring_mem, 0, ring_size);
+            me->buf_ring = (struct io_uring_buf_ring *)ring_mem;
+
+            reg.ring_addr    = (unsigned long)ring_mem;
+            reg.ring_entries = ring_entries;
+            reg.bgid         = me->io_uring_bgid;
+            reg.flags        = IOU_PBUF_RING_DMA;
+            reg.resv[0]      = (unsigned long)me->io_uring_buf_mem;
+            reg.resv[1]      = total_mem;
+
+            ret = io_uring_register_buf_ring(me->ring, &reg, 0);
+            if (ret) {
+                fprintf(stderr, "Failed to register io_uring buffer ring (DMA): %s\n",
+                        strerror(-ret));
+                free(ring_mem);
+                exit(EXIT_FAILURE);
+            }
         }
 
         // Add all buffers to the ring
