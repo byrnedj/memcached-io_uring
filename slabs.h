@@ -49,6 +49,10 @@ unsigned int slabs_available_chunks(unsigned int id, bool *mem_flag, unsigned in
 void slabs_mlock(void);
 void slabs_munlock(void);
 
+/* Accessors for the preallocated slab memory region (NULL if not preallocated) */
+void *slabs_get_mem_base(void);
+size_t slabs_get_mem_limit(void);
+
 /* utilities for page moving */
 void *slabs_peek_page(const unsigned int id, uint32_t *size, uint32_t *perslab);
 void do_slabs_unlink_free_chunk(const unsigned int id, item *it);

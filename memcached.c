@@ -2972,6 +2972,9 @@ static void recv_complete(struct io_uring_op_ctx *op, int res, unsigned int cqe_
     conn *c = op->c;
     int buf_id = -1;
 
+    if (settings.verbose) fprintf(stderr, "DEBUG: recv_complete fd=%d res=%d flags=0x%x state=%d\n",
+            c->sfd, res, cqe_flags, c->state);
+
     // Extract buffer ID from CQE flags if using provided buffers
     if (op->using_provided_buf && (cqe_flags & IORING_CQE_F_BUFFER)) {
         buf_id = cqe_flags >> IORING_CQE_BUFFER_SHIFT;
@@ -3072,6 +3075,8 @@ static void recv_complete(struct io_uring_op_ctx *op, int res, unsigned int cqe_
 
 void queue_recv(conn *c, void* buf, size_t len)
 {
+    if (settings.verbose) fprintf(stderr, "DEBUG: queue_recv fd=%d buf=%p len=%zu state=%d\n",
+            c->sfd, buf, len, c->state);
     //todo make this a thread local allocator like rbuf_cache
     struct io_uring_op_ctx *op = do_cache_alloc(c->thread->io_uring_cache);
     if (!op) {
@@ -3119,7 +3124,15 @@ void queue_recv(conn *c, void* buf, size_t len)
             io_uring_prep_recv(sqe, c->sfd, c->rcurr + c->rbytes, space_available, 0);
         }
     } else {
-        io_uring_prep_recv(sqe, c->sfd, buf, len, 0);
+        /* Reading value data directly into an item buffer.
+         * Use IORING_OP_READ_FIXED if slab memory is registered as a
+         * fixed buffer, enabling DMA offload for the copy.
+         */
+        if (c->thread->fixed_bufs_registered) {
+            io_uring_prep_read_fixed(sqe, c->sfd, buf, len, 0, 0);
+        } else {
+            io_uring_prep_recv(sqe, c->sfd, buf, len, 0);
+        }
     }
 
     io_uring_sqe_set_data(sqe, op);          /* attaches context  */
@@ -3150,6 +3163,7 @@ void drive_machine(conn *c) {
             //if (settings.use_io_uring) {
             //    fprintf(stderr, "Cannot accept new connections with io_uring enabled (tid: %d).\n", pthread_self());
             //} else {
+            if (settings.verbose) fprintf(stderr, "DEBUG: conn_listening: attempting accept on fd %d\n", c->sfd);
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
@@ -3160,6 +3174,7 @@ void drive_machine(conn *c) {
 #else
             sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
 #endif
+            if (settings.verbose) fprintf(stderr, "DEBUG: accept returned sfd=%d errno=%d\n", sfd, errno);
             if (sfd == -1) {
                 if (use_accept4 && errno == ENOSYS) {
                     use_accept4 = 0;
@@ -3213,6 +3228,7 @@ void drive_machine(conn *c) {
                     break;
                 }
 
+                if (settings.verbose) fprintf(stderr, "DEBUG: dispatching new conn sfd=%d to worker\n", sfd);
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
             }
@@ -3221,6 +3237,7 @@ void drive_machine(conn *c) {
             break;
 
         case conn_waiting:
+            if (settings.verbose) fprintf(stderr, "DEBUG: conn_waiting fd=%d\n", c->sfd);
             rbuf_release(c);
             if (settings.use_io_uring) {
                 // If we use io_uring, we can queue a recv operation.
@@ -3504,6 +3521,7 @@ void drive_machine(conn *c) {
             break;
 
         case conn_closing:
+            if (settings.verbose) fprintf(stderr, "DEBUG: conn_closing fd=%d reason=%d\n", c->sfd, c->close_reason);
             if (IS_UDP(c->transport))
                 conn_cleanup(c);
             else
@@ -6418,12 +6436,16 @@ int main (int argc, char **argv) {
     uriencode_init();
 
     /* enter the event loop */
+    if (settings.verbose) fprintf(stderr, "DEBUG: entering main event loop\n");
     while (!stop_main_loop) {
-        if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
+        int loop_ret = event_base_loop(main_base, EVLOOP_ONCE);
+        if (loop_ret != 0) {
+            if (settings.verbose) fprintf(stderr, "DEBUG: main event_base_loop returned %d\n", loop_ret);
             retval = EXIT_FAILURE;
             break;
         }
     }
+    if (settings.verbose) fprintf(stderr, "DEBUG: exited main event loop, stop_main_loop=%d\n", stop_main_loop);
 
     switch (stop_main_loop) {
         case GRACE_STOP:

@@ -7,7 +7,7 @@
  */
 #include "memcached.h"
 #include "hugepage.h"
-#include <dto.h>
+//#include <dto.h>
 #include <linux/mman.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -186,7 +186,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             do_slab_prealloc = true;
             mem_current = mem_base;
             mem_avail = mem_limit;
-            dto_memset_pages(mem_base, (char *)mem_base + mem_limit, 2*1024*1024);
+            //dto_memset_pages(mem_base, (char *)mem_base + mem_limit, 2*1024*1024);
         } else {
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
                     " one large chunk.\nWill allocate in smaller chunks\n");
@@ -257,6 +257,14 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             slabs_preallocate(power_largest);
         }
     }
+}
+
+void *slabs_get_mem_base(void) {
+    return mem_base;
+}
+
+size_t slabs_get_mem_limit(void) {
+    return mem_limit;
 }
 
 void slabs_prefill_global(void) {

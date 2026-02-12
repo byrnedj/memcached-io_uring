@@ -752,6 +752,7 @@ typedef struct {
     int io_uring_bgid;            /* buffer group ID for provided buffers */
     uint64_t buf_selected;        /* debug: buffers selected by kernel */
     uint64_t buf_recycled;        /* debug: buffers recycled back to ring */
+    bool fixed_bufs_registered;   /* true if slab memory registered as fixed bufs */
 #ifdef EXTSTORE
     void *storage;              /* data object for storage system */
 #endif

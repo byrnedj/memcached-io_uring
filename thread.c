@@ -644,6 +644,8 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
 static void thread_libevent_io_uring_process(evutil_socket_t fd, short which, void *arg) {
     LIBEVENT_THREAD *me = arg;
     uint64_t ev_count = 0; // max number of events to loop through this run.
+    if (settings.verbose) fprintf(stderr, "DEBUG: io_uring_process fired thread=%lu fd=%d\n",
+            (unsigned long)me->thread_id, fd);
     // NOTE: unlike pipe we aren't limiting the number of events per read.
     // However we do limit the number of queue pulls to what the count was at
     // the time of this function firing.
@@ -704,6 +706,8 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
     CQ_ITEM *item;
     conn *c;
     uint64_t ev_count = 0; // max number of events to loop through this run.
+    if (settings.verbose) fprintf(stderr, "DEBUG: thread_libevent_process fired thread=%lu fd=%d\n",
+            (unsigned long)me->thread_id, fd);
 #ifdef HAVE_EVENTFD
     // NOTE: unlike pipe we aren't limiting the number of events per read.
     // However we do limit the number of queue pulls to what the count was at
@@ -730,8 +734,12 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
             return;
         }
 
+        if (settings.verbose) fprintf(stderr, "DEBUG: thread %lu processing queue item mode=%d\n",
+                (unsigned long)me->thread_id, item->mode);
         switch (item->mode) {
             case queue_new_conn:
+                if (settings.verbose) fprintf(stderr, "DEBUG: thread %lu conn_new sfd=%d\n",
+                        (unsigned long)me->thread_id, item->sfd);
                 c = conn_new(item->sfd, item->init_state, item->event_flags,
                                    item->read_buffer_size, item->transport,
                                    me->base, item->ssl, item->conntag, item->bproto,
@@ -761,12 +769,12 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                         drive_machine(c);
 
             		int ready = io_uring_sq_ready(me->ring);
+            		if (settings.verbose) fprintf(stderr, "DEBUG: thread %lu after drive_machine, sq_ready=%d\n",
+            		        (unsigned long)me->thread_id, ready);
             		if (ready > 0) {
-            		    if (settings.verbose > 2) {
-            		        fprintf(stderr, "[io_uring] thread %lu first ready events: %d\n",
-            		                (unsigned long)me->thread_id, ready);
-            		    }
             		    int ret = io_uring_submit(me->ring);
+            		    if (settings.verbose) fprintf(stderr, "DEBUG: thread %lu submit ret=%d\n",
+            		            (unsigned long)me->thread_id, ret);
             		    if (ret < 0) {
             		        fprintf(stderr, "[io_uring] thread %lu submit failed: %s\n",
             		                (unsigned long)me->thread_id, strerror(-ret));
@@ -1399,6 +1407,34 @@ static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
                     (unsigned long)me->thread_id, me->io_uring_buf_count,
                     (size_t)IO_URING_REGISTERED_BUFFER_SIZE, me->io_uring_bgid,
                     me->buf_ring->tail, io_uring_buf_ring_mask(ring_entries));
+        }
+    }
+
+    /* Register the preallocated slab memory as a fixed buffer for DMA offload.
+     * This enables IORING_OP_READ_FIXED to use DMA when reading data directly
+     * into memcached items (e.g., value data).
+     */
+    me->fixed_bufs_registered = false;
+    {
+        void *slab_base = slabs_get_mem_base();
+        size_t slab_size = slabs_get_mem_limit();
+
+        if (slab_base && slab_size > 0) {
+            struct iovec iov = {
+                .iov_base = slab_base,
+                .iov_len = slab_size,
+            };
+            ret = io_uring_register_buffers(me->ring, &iov, 1);
+            if (ret < 0) {
+                fprintf(stderr, "Thread %d: Failed to register fixed buffers: %s\n",
+                        me->thread_baseid, strerror(-ret));
+            } else {
+                me->fixed_bufs_registered = true;
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "Thread %d: Registered slab memory as fixed buffer (%p, %zu bytes)\n",
+                            me->thread_baseid, slab_base, slab_size);
+                }
+            }
         }
     }
 }
