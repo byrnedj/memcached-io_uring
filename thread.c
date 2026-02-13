@@ -1388,8 +1388,19 @@ static void memcached_thread_io_uring_init(LIBEVENT_THREAD *me) {
             if (ret) {
                 fprintf(stderr, "Failed to register io_uring buffer ring (DMA): %s\n",
                         strerror(-ret));
-                free(ring_mem);
-                exit(EXIT_FAILURE);
+                /* Fall back to non-DMA buffer ring */
+                memset(&reg, 0, sizeof(reg));
+                reg.ring_addr    = (unsigned long)ring_mem;
+                reg.ring_entries = ring_entries;
+                reg.bgid         = me->io_uring_bgid;
+                ret = io_uring_register_buf_ring(me->ring, &reg, 0);
+                if (ret) {
+                    fprintf(stderr, "Failed to register io_uring buffer ring (fallback): %s\n",
+                            strerror(-ret));
+                    free(ring_mem);
+                    exit(EXIT_FAILURE);
+                }
+                fprintf(stderr, "Registered non-DMA buffer ring as fallback\n");
             }
         }
 
